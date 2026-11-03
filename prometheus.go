@@ -36,10 +36,13 @@ func (p *Prometheus) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	p.pass(w, r, tenant, r.URL.Path, kept)
 }
 
+// promQL parses with Prometheus' defaults (no experimental syntax).
+var promQL = parser.NewParser(parser.Options{})
+
 // EnforcePromQL adds label="value" to every selector of the query (vector and range alike, in subqueries too). A
 // selector's own matchers on the label stay, and both must hold.
 func EnforcePromQL(query, label, value string) (string, error) {
-	expr, err := parser.ParseExpr(query)
+	expr, err := promQL.ParseExpr(query)
 	if err != nil {
 		return "", err
 	}

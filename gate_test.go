@@ -22,7 +22,7 @@ import (
 // selectorsOf lists every selector's matchers in a query.
 func selectorsOf(t *testing.T, query string) [][]*labels.Matcher {
 	t.Helper()
-	expr, err := parser.ParseExpr(query)
+	expr, err := promQL.ParseExpr(query)
 	if err != nil {
 		t.Fatalf("enforced query doesn't parse: %v\n%s", err, query)
 	}
