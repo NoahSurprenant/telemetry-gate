@@ -12,6 +12,7 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/promql/parser"
@@ -325,8 +326,8 @@ func TestFilterSearchNamesOnlyTheTenantsRootAndCounts(t *testing.T) {
 // grif-prod), grif-prod calling grif-test through Traefik, and grif-test's browser span above Cloudflare's.
 const edgeLeakJSON = `{"trace":{"resourceSpans":[
 	{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"edge_processing"}}]},"scopeSpans":[{"spans":[
-		{"spanId":"cf1","parentSpanId":"b1","name":"cloudflare_request"},
-		{"spanId":"cf2","parentSpanId":"cf1","name":"response"}]}]},
+		{"spanId":"cf1","parentSpanId":"b1","name":"shared request secret"},
+		{"spanId":"cf2","parentSpanId":"cf1","name":"shared response secret"}]}]},
 	{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"origin_fetch"}}]},"scopeSpans":[{"spans":[
 		{"spanId":"of1","parentSpanId":"cf1","name":"origin"},
 		{"spanId":"of2","parentSpanId":"cf1","name":"prod origin secret"}]}]},
@@ -351,7 +352,8 @@ func TestFilterTraceKeepsOnlyTheEdgeSpansOfTheTenantsOwnRequests(t *testing.T) {
 		t.Fatal("want kept")
 	}
 	out, _ := json.Marshal(body)
-	for _, name := range []string{"cloudflare_request", "response", "origin", "router", "GET x", "browser click", "called by prod"} {
+	// The Cloudflare request fetched from two origins: its root and response are prod's request's too
+	for _, name := range []string{"origin", "router", "GET x", "browser click", "called by prod"} {
 		if !strings.Contains(string(out), `"`+name+`"`) {
 			t.Errorf("%s removed: %s", name, out)
 		}
@@ -371,6 +373,58 @@ const duplicateIDJSON = `{"trace":{"resourceSpans":[
 	{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"halo-gateway"}}]},"scopeSpans":[{"spans":[
 		{"spanId":"h1","parentSpanId":"p1","name":"prod gateway secret"}]}]}
 ]}}`
+
+// A second origin fetch whose app's spans aren't in the trace (not yet ingested, sampled out or untraced): its
+// Traefik call has no callee here.
+const missingCalleeJSON = `{"trace":{"resourceSpans":[
+	{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"edge_processing"}}]},"scopeSpans":[{"spans":[
+		{"spanId":"cf1","name":"shared request secret"}]}]},
+	{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"origin_fetch"}}]},"scopeSpans":[{"spans":[
+		{"spanId":"of1","parentSpanId":"cf1","name":"origin"},
+		{"spanId":"of2","parentSpanId":"cf1","name":"other origin secret"}]}]},
+	{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"traefik"}}]},"scopeSpans":[{"spans":[
+		{"spanId":"t1","parentSpanId":"of1","name":"router","kind":"SPAN_KIND_SERVER"},
+		{"spanId":"t5","parentSpanId":"of2","name":"other router secret","kind":"SPAN_KIND_SERVER"},
+		{"spanId":"t5b","parentSpanId":"t5","name":"other proxy secret","kind":"SPAN_KIND_CLIENT"}]}]},
+	{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"grif-test"}}]},"scopeSpans":[{"spans":[
+		{"spanId":"g1","parentSpanId":"t1","name":"GET x"}]}]}
+]}}`
+
+func TestFilterTraceTreatsACallWhoseCalleeIsMissingAsAnotherApps(t *testing.T) {
+	var body map[string]any
+	json.Unmarshal([]byte(missingCalleeJSON), &body)
+	FilterTrace(body, "grif-test", Related{Edge: map[string]bool{"edge_processing": true, "origin_fetch": true, "traefik": true}})
+	out, _ := json.Marshal(body)
+	if strings.Contains(string(out), "secret") {
+		t.Errorf("a span of a request to an app not in the trace left in: %s", out)
+	}
+	if !strings.Contains(string(out), `"router"`) || !strings.Contains(string(out), `"origin"`) {
+		t.Errorf("the tenant's own edge spans removed: %s", out)
+	}
+}
+
+func TestFilterTraceEndsOnACycleOfEdgeSpans(t *testing.T) {
+	for _, cycle := range []string{
+		`{"spanId":"f","parentSpanId":"f","name":"loop"}`,
+		`{"spanId":"f","parentSpanId":"e","name":"loop"},{"spanId":"e","parentSpanId":"f","name":"loop"}`,
+	} {
+		var body map[string]any
+		json.Unmarshal([]byte(`{"trace":{"resourceSpans":[
+			{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"traefik"}}]},"scopeSpans":[{"spans":[`+cycle+`]}]},
+			{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"grif-test"}}]},"scopeSpans":[{"spans":[
+				{"spanId":"g","parentSpanId":"f","name":"mine"}]}]}]}}`), &body)
+		done := make(chan bool, 1)
+		go func() { done <- FilterTrace(body, "grif-test", Related{Edge: map[string]bool{"traefik": true}}) }()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("%s: still filtering after 5s", cycle)
+		}
+		if out, _ := json.Marshal(body); strings.Contains(string(out), "loop") {
+			t.Errorf("a cycle's spans left in: %s", out)
+		}
+	}
+}
 
 func TestFilterTraceFollowsNoSpanIDTwoSpansShare(t *testing.T) {
 	var body map[string]any
