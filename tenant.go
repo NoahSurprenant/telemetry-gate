@@ -50,20 +50,29 @@ type cached struct {
 }
 
 func NewPodResolver(api, selector string, namespaces *regexp.Regexp) (*PodResolver, error) {
-	ca, err := os.ReadFile(caFile)
+	client, token, err := kubeClient()
 	if err != nil {
 		return nil, err
 	}
+	return newPodResolver(api, selector, namespaces, client, token), nil
+}
+
+// kubeClient is a client for the Kubernetes API as the pod's service account: the cluster's CA, and its token.
+func kubeClient() (*http.Client, func() (string, error), error) {
+	ca, err := os.ReadFile(caFile)
+	if err != nil {
+		return nil, nil, err
+	}
 	pool := x509.NewCertPool()
 	if !pool.AppendCertsFromPEM(ca) {
-		return nil, fmt.Errorf("no certificate in %s", caFile)
+		return nil, nil, fmt.Errorf("no certificate in %s", caFile)
 	}
 	client := &http.Client{Timeout: 10 * time.Second, Transport: &http.Transport{TLSClientConfig: &tls.Config{RootCAs: pool}}}
-	return newPodResolver(api, selector, namespaces, client, func() (string, error) {
+	return client, func() (string, error) {
 		// Read each time: the kubelet rotates it.
 		b, err := os.ReadFile(tokenFile)
 		return string(b), err
-	}), nil
+	}, nil
 }
 
 func newPodResolver(api, selector string, namespaces *regexp.Regexp, client *http.Client, token func() (string, error)) *PodResolver {

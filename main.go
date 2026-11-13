@@ -54,6 +54,16 @@ func main() {
 		log.Error("no Kubernetes API", "error", err)
 		os.Exit(2)
 	}
+	hosts, err := NewIngressRouteHosts(*apiServer)
+	if err != nil {
+		log.Error("no Kubernetes API", "error", err)
+		os.Exit(2)
+	}
+	related := Related{Edge: setOf(*edgeServices), Downstream: setOf(*downstream)}
+	if err := checkRelated(related, pattern); err != nil {
+		log.Error("bad -edge-services or -downstream-services", "error", err)
+		os.Exit(2)
+	}
 
 	client := &http.Client{Timeout: 60 * time.Second}
 	type side struct {
@@ -65,7 +75,7 @@ func main() {
 	sides := []side{
 		{*lokiAddr, *lokiURL, func(u *url.URL) http.Handler { return &Loki{Gate: g(u), Label: *label} }},
 		{*promAddr, *prometheusURL, func(u *url.URL) http.Handler { return &Prometheus{Gate: g(u), Label: *label} }},
-		{*tempoAddr, *tempoURL, func(u *url.URL) http.Handler { return &Tempo{Gate: g(u), Related: Related{Edge: setOf(*edgeServices), Downstream: setOf(*downstream)}} }},
+		{*tempoAddr, *tempoURL, func(u *url.URL) http.Handler { return &Tempo{Gate: g(u), Related: related, Hosts: hosts} }},
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)

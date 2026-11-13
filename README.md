@@ -18,15 +18,19 @@ Everything else is a 404, a query that can't be narrowed a 400, an unknown calle
 
 Settings (flag or environment): `LOKI_URL`, `PROMETHEUS_URL`, `TEMPO_URL` (each unset turns its port off),
 `POD_SELECTOR`, `NAMESPACES`, `TENANT_LABEL` (default `service_name`), `EDGE_SERVICES`, `DOWNSTREAM_SERVICES`. It needs `get` and `list` on pods,
-cluster-wide.
+cluster-wide (and on `ingressroutes.traefik.io` with `EDGE_SERVICES`).
 
 **Edge services** (`EDGE_SERVICES`, comma-separated, ex. `traefik,edge_processing,origin_fetch`): the ingress and the CDN in
 front of the tenants. A trace fetched by id also keeps, every field, the edge spans a tenant's span sits under, from
-the tenant's span up, while each leads to no other app: through edge spans, no other service's span, no shared id,
-no cycle, and no client call (Traefik's proxying) whose callee isn't in the trace (not ingested yet, sampled out,
-untraced). So a Cloudflare request that also fetched from another app is not kept. And their edge descendants that
-lead to no other app (Cloudflare's firewall and response). Not a chain under another service's span (another app
-calling the tenant through the ingress), nor one with a cycle or longer than 32 spans.
+the tenant's span up, while each leads to no other app (through edge spans: no other service's span, no other
+host, no shared id, no cycle, nothing deeper than 64, and no client call whose callee isn't in the trace) and
+names no host but the tenant's, and only when one of them names one of the tenant's hosts (`server.address` on
+Cloudflare's request and Traefik's router): the evidence that it is the tenant's own request. A tenant's hosts
+are the `Host(...)` rules of the Traefik IngressRoutes in its namespace, read from the Kubernetes API (kept 15s);
+when they can't be read, no edge span is kept. Then their edge descendants that lead to no other app and name no
+other host (Cloudflare's firewall and response). Not a chain under another service's span, nor one with a cycle or
+longer than 32 spans. Needs `get` and `list` on `ingressroutes.traefik.io` too. Startup refuses a service in both
+lists or named like a tenant.
 
 **Downstream services** (`DOWNSTREAM_SERVICES`, comma-separated, ex. `halo-gateway`): services the tenants call. A
 trace fetched by id also keeps their spans under the tenant's, through downstream spans only (a gateway reached

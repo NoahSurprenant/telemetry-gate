@@ -1,9 +1,12 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"regexp"
 	"strings"
@@ -14,6 +17,9 @@ import (
 type Tempo struct {
 	Gate
 	Related
+	// Hosts: each tenant's own hosts, the evidence an edge span is its request's. Read only when there are edge
+	// services; none read (an error) shows no edge span.
+	Hosts Hosts
 }
 
 // Related names the services whose spans a tenant's trace keeps where they belong to the tenant's requests
@@ -70,7 +76,38 @@ func (t *Tempo) trace(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	t.filter(w, r, tenant, r.URL.Path, only(r.URL.Query(), "start", "end"), func(body map[string]any) bool { return FilterTrace(body, tenant, t.Related) })
+	t.filter(w, r, tenant, r.URL.Path, only(r.URL.Query(), "start", "end"), func(body map[string]any) bool { return FilterTrace(body, tenant, t.Related, t.tenantHosts(r.Context(), tenant)) })
+}
+
+// tenantHosts reads the tenant's hosts when edge spans may be shown; nil (so none shown) when they can't be read.
+func (t *Tempo) tenantHosts(ctx context.Context, tenant string) map[string]bool {
+	if len(t.Edge) == 0 || t.Hosts == nil {
+		return nil
+	}
+	hosts, err := t.Hosts.Hosts(ctx, tenant)
+	if err != nil {
+		t.Log.Warn("hosts", "tenant", tenant, "error", err)
+		return nil
+	}
+	return hosts
+}
+
+// checkRelated refuses related services that would blur whose a span is: one in both lists (its spans would be
+// kept as both, above and under the tenant's), or one named like a tenant (a tenant's spans would pass for it).
+func checkRelated(related Related, namespaces *regexp.Regexp) error {
+	for name := range related.Edge {
+		if related.Downstream[name] {
+			return fmt.Errorf("%s is both an edge and a downstream service", name)
+		}
+	}
+	for _, set := range []map[string]bool{related.Edge, related.Downstream} {
+		for name := range set {
+			if namespaces.MatchString(name) {
+				return fmt.Errorf("%s is named like a tenant", name)
+			}
+		}
+	}
+	return nil
 }
 
 // filter reads the upstream's JSON answer and sends it on after keep; keep false is a 404.
@@ -181,15 +218,18 @@ func FilterSearch(body map[string]any, tenant string) bool {
 // FilterTrace keeps a trace's resource spans whose service.name is the tenant, and of the related services' spans
 // only those of the tenant's own requests (false when the tenant has no spans):
 //   - edge: up the chain of edge spans a tenant's span sits under, each span while it leads to no other app
-//     (leadsElsewhere: so not the Cloudflare request of a second origin fetch for another app), when the chain
-//     starts the trace or sits under the tenant's own span (its browser's), not another service's (another app
-//     calling the tenant through the ingress); and those spans' edge descendants that lead to no other app
-//     (Cloudflare's firewall and response). A cycle or a chain longer than maxEdgeChain shows nothing;
+//     (leadsElsewhere: so not the Cloudflare request of a second origin fetch for another app) and names no host but
+//     the tenant's (hosts: its IngressRoutes'), when the chain starts the trace or sits under the tenant's own span
+//     (its browser's), not another service's (another app calling the tenant through the ingress), and only when one
+//     of its spans names one of the tenant's hosts (Cloudflare's request, Traefik's router): the evidence it is the
+//     tenant's request. Then those spans' edge descendants that lead to no other app and name no other host
+//     (Cloudflare's firewall and response). A cycle or a chain longer than maxEdgeChain shows nothing, and no hosts
+//     (they couldn't be read) no edge span;
 //   - downstream: the spans under the tenant's, through downstream spans only (the Halo gateway's).
 //
 // A span id two spans share links nothing: the trace's spans come from its services, a tenant's included, so one
 // could reuse another's id to sit under or over its spans.
-func FilterTrace(body map[string]any, tenant string, related Related) bool {
+func FilterTrace(body map[string]any, tenant string, related Related, hosts map[string]bool) bool {
 	trace, ok := body["trace"].(map[string]any)
 	if !ok {
 		return false
@@ -204,7 +244,7 @@ func FilterTrace(body map[string]any, tenant string, related Related) bool {
 
 	// Edge: up from each of the tenant's spans through edge spans, each one shown while it leads to no other app,
 	// unless the chain sits under another service's span; then their edge descendants that lead to no other app
-	elsewhere := g.leadsElsewhere(tenant, related.Edge)
+	elsewhere := g.leadsElsewhere(tenant, related.Edge, hosts)
 	var edgeQueue []string
 	for _, id := range g.of(tenant) {
 		if g.shared[id] {
@@ -222,10 +262,20 @@ func FilterTrace(body map[string]any, tenant string, related Related) bool {
 		if seen[top] || g.shared[top] || (top != "" && related.Edge[g.service(top)]) || (g.known(top) && g.service(top) != tenant) {
 			continue
 		}
+		var kept []string
+		evidence := false
 		for _, edgeID := range chain {
-			if elsewhere(edgeID) {
+			host := g.spans[edgeID].host
+			if elsewhere(edgeID) || (host != "" && !hosts[host]) {
 				break
 			}
+			kept = append(kept, edgeID)
+			evidence = evidence || host != ""
+		}
+		if !evidence {
+			continue
+		}
+		for _, edgeID := range kept {
 			if !shown[edgeID] {
 				shown[edgeID] = true
 				edgeQueue = append(edgeQueue, edgeID)
@@ -233,7 +283,8 @@ func FilterTrace(body map[string]any, tenant string, related Related) bool {
 		}
 	}
 	g.descend(edgeQueue, shown, func(child string) bool {
-		return related.Edge[g.service(child)] && !elsewhere(child)
+		host := g.spans[child].host
+		return related.Edge[g.service(child)] && (host == "" || hosts[host]) && !elsewhere(child)
 	})
 
 	// Downstream: under the tenant's spans
@@ -252,18 +303,23 @@ func FilterTrace(body map[string]any, tenant string, related Related) bool {
 // Traefik's) is a handful deep, and a longer one (forged) shows nothing.
 const maxEdgeChain = 32
 
+// maxEdgeDepth caps how far below an edge span leadsElsewhere looks: Cloudflare's and Traefik's spans are a few
+// levels deep, and anything deeper (forged) counts as another app's.
+const maxEdgeDepth = 64
+
 // leadsElsewhere answers, for an edge span, whether anything under it is another app's: through edge spans, a span
-// of a service neither the tenant nor an edge one, a shared id, a cycle, or a client call (Traefik's proxying) whose
-// callee isn't in the trace (not ingested yet, sampled out, untraced). The tenant's spans end the search.
-func (g spanGraph) leadsElsewhere(tenant string, edge map[string]bool) func(id string) bool {
+// of a service neither the tenant nor an edge one, an edge span naming another host, a shared id, a cycle, a tree
+// deeper than maxEdgeDepth, or a client call (Traefik's proxying) whose callee isn't in the trace (not ingested
+// yet, sampled out, untraced). The tenant's spans end the search.
+func (g spanGraph) leadsElsewhere(tenant string, edge, hosts map[string]bool) func(id string) bool {
 	known := map[string]bool{}
 	visiting := map[string]bool{}
-	var elsewhere func(id string) bool
-	elsewhere = func(id string) bool {
+	var below func(id string, depth int) bool
+	below = func(id string, depth int) bool {
 		if v, done := known[id]; done {
 			return v
 		}
-		if visiting[id] {
+		if visiting[id] || depth > maxEdgeDepth {
 			return true
 		}
 		visiting[id] = true
@@ -278,7 +334,8 @@ func (g spanGraph) leadsElsewhere(tenant string, edge map[string]bool) func(id s
 				result = true
 			case service == tenant:
 			case edge[service]:
-				result = elsewhere(child)
+				host := g.spans[child].host
+				result = (host != "" && !hosts[host]) || below(child, depth+1)
 			default:
 				result = true
 			}
@@ -286,10 +343,28 @@ func (g spanGraph) leadsElsewhere(tenant string, edge map[string]bool) func(id s
 		known[id] = result
 		return result
 	}
-	return elsewhere
+	return func(id string) bool { return below(id, 0) }
 }
 
 const clientKind = "SPAN_KIND_CLIENT"
+
+// hostOf reads a span's server.address when it is a host name, lower case; "" for none or an IP address.
+func hostOf(span map[string]any) string {
+	attrs, _ := span["attributes"].([]any)
+	for _, a := range attrs {
+		attr, _ := a.(map[string]any)
+		if attr["key"] != "server.address" {
+			continue
+		}
+		value, _ := attr["value"].(map[string]any)
+		host, _ := value["stringValue"].(string)
+		if host == "" || net.ParseIP(host) != nil {
+			return ""
+		}
+		return strings.ToLower(host)
+	}
+	return ""
+}
 
 // spanGraph indexes a trace's spans by id: each one's parent and service, its children, and the ids more than one
 // span has (shared, linked to nothing).
@@ -300,7 +375,9 @@ type spanGraph struct {
 	byService map[string][]string
 }
 
-type spanRef struct{ parent, service, kind string }
+// spanRef is a span as the filter sees it: host is the server.address it names, when that is a host name (Cloudflare's
+// request, Traefik's router; not Traefik's proxying, which names the pod's address).
+type spanRef struct{ parent, service, kind, host string }
 
 func indexSpans(resources []any) spanGraph {
 	g := spanGraph{spans: map[string]spanRef{}, children: map[string][]string{}, shared: map[string]bool{}, byService: map[string][]string{}}
@@ -316,7 +393,7 @@ func indexSpans(resources []any) spanGraph {
 			if _, seen := g.spans[id]; seen {
 				g.shared[id] = true
 			}
-			g.spans[id] = spanRef{parent, service, kind}
+			g.spans[id] = spanRef{parent, service, kind, hostOf(span)}
 			g.children[parent] = append(g.children[parent], id)
 			g.byService[service] = append(g.byService[service], id)
 		}
