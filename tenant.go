@@ -49,14 +49,6 @@ type cached struct {
 	until  time.Time
 }
 
-func NewPodResolver(api, selector string, namespaces *regexp.Regexp) (*PodResolver, error) {
-	client, token, err := kubeClient()
-	if err != nil {
-		return nil, err
-	}
-	return newPodResolver(api, selector, namespaces, client, token), nil
-}
-
 // kubeClient is a client for the Kubernetes API as the pod's service account: the cluster's CA, and its token.
 func kubeClient() (*http.Client, func() (string, error), error) {
 	ca, err := os.ReadFile(caFile)

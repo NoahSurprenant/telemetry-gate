@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"regexp"
+	"slices"
 	"strings"
 )
 
@@ -76,12 +77,13 @@ func (t *Tempo) trace(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	t.filter(w, r, tenant, r.URL.Path, only(r.URL.Query(), "start", "end"), func(body map[string]any) bool { return FilterTrace(body, tenant, t.Related, t.tenantHosts(r.Context(), tenant)) })
+	t.filter(w, r, tenant, r.URL.Path, only(r.URL.Query(), "start", "end"), func(body map[string]any) bool { return FilterTrace(body, tenant, t.Related, t.tenantHosts(r.Context(), tenant, body)) })
 }
 
-// tenantHosts reads the tenant's hosts when edge spans may be shown; nil (so none shown) when they can't be read.
-func (t *Tempo) tenantHosts(ctx context.Context, tenant string) map[string]bool {
-	if len(t.Edge) == 0 || t.Hosts == nil {
+// tenantHosts reads the tenant's hosts when the trace has edge spans to show; nil (so none shown) when they can't
+// be read.
+func (t *Tempo) tenantHosts(ctx context.Context, tenant string, body map[string]any) map[string]bool {
+	if len(t.Edge) == 0 || t.Hosts == nil || !hasService(body, t.Edge) {
 		return nil
 	}
 	hosts, err := t.Hosts.Hosts(ctx, tenant)
@@ -90,6 +92,18 @@ func (t *Tempo) tenantHosts(ctx context.Context, tenant string) map[string]bool 
 		return nil
 	}
 	return hosts
+}
+
+// hasService says whether a trace has spans of one of services.
+func hasService(body map[string]any, services map[string]bool) bool {
+	trace, _ := body["trace"].(map[string]any)
+	resources, _ := trace["resourceSpans"].([]any)
+	for _, rs := range resources {
+		if services[serviceName(rs)] {
+			return true
+		}
+	}
+	return false
 }
 
 // checkRelated refuses related services that would blur whose a span is: one in both lists (its spans would be
@@ -258,24 +272,20 @@ func FilterTrace(body map[string]any, tenant string, related Related, hosts map[
 			chain = append(chain, top)
 			top = g.spans[top].parent
 		}
-		// A cycle, a chain too long, a shared id, or another service's span above: nothing of this chain
-		if seen[top] || g.shared[top] || (top != "" && related.Edge[g.service(top)]) || (g.known(top) && g.service(top) != tenant) {
+		// Only a chain that starts the trace or sits under the tenant's own span (its browser's): not under a cycle, a
+		// chain too long, a shared id, another service's span or one not in the trace (sampled out, not ingested, forged)
+		if len(chain) == 0 || seen[top] || g.shared[top] || (top != "" && g.service(top) != tenant) {
 			continue
 		}
-		var kept []string
-		evidence := false
-		for _, edgeID := range chain {
+		// The evidence is on its top, the request's own root (a tenant can't forge a span above it): the tenant's host.
+		// And none of it leads to another app or names another host.
+		if !hosts[g.spans[chain[len(chain)-1]].host] || slices.ContainsFunc(chain, func(edgeID string) bool {
 			host := g.spans[edgeID].host
-			if elsewhere(edgeID) || (host != "" && !hosts[host]) {
-				break
-			}
-			kept = append(kept, edgeID)
-			evidence = evidence || host != ""
-		}
-		if !evidence {
+			return elsewhere(edgeID) || (host != "" && !hosts[host])
+		}) {
 			continue
 		}
-		for _, edgeID := range kept {
+		for _, edgeID := range chain {
 			if !shown[edgeID] {
 				shown[edgeID] = true
 				edgeQueue = append(edgeQueue, edgeID)
@@ -314,17 +324,23 @@ const maxEdgeDepth = 64
 func (g spanGraph) leadsElsewhere(tenant string, edge, hosts map[string]bool) func(id string) bool {
 	known := map[string]bool{}
 	visiting := map[string]bool{}
-	var below func(id string, depth int) bool
-	below = func(id string, depth int) bool {
+	// below answers for id reached at depth, and whether the depth cap decided it (then it isn't kept: from nearer
+	// the top the answer may differ)
+	var below func(id string, depth int) (bool, bool)
+	below = func(id string, depth int) (result, capped bool) {
 		if v, done := known[id]; done {
-			return v
+			return v, false
 		}
-		if visiting[id] || depth > maxEdgeDepth {
-			return true
+		if visiting[id] {
+			return true, false
+		}
+		if depth > maxEdgeDepth {
+			return true, true
 		}
 		visiting[id] = true
+		defer delete(visiting, id)
 		children := g.children[id]
-		result := len(children) == 0 && g.spans[id].kind == clientKind
+		result = len(children) == 0 && g.spans[id].kind == clientKind
 		for _, child := range children {
 			if result {
 				break
@@ -334,16 +350,26 @@ func (g spanGraph) leadsElsewhere(tenant string, edge, hosts map[string]bool) fu
 				result = true
 			case service == tenant:
 			case edge[service]:
-				host := g.spans[child].host
-				result = (host != "" && !hosts[host]) || below(child, depth+1)
+				if host := g.spans[child].host; host != "" && !hosts[host] {
+					result = true
+				} else {
+					var childCapped bool
+					result, childCapped = below(child, depth+1)
+					capped = capped || childCapped
+				}
 			default:
 				result = true
 			}
 		}
-		known[id] = result
+		if !capped {
+			known[id] = result
+		}
+		return result, capped
+	}
+	return func(id string) bool {
+		result, _ := below(id, 0)
 		return result
 	}
-	return func(id string) bool { return below(id, 0) }
 }
 
 const clientKind = "SPAN_KIND_CLIENT"
@@ -358,10 +384,11 @@ func hostOf(span map[string]any) string {
 		}
 		value, _ := attr["value"].(map[string]any)
 		host, _ := value["stringValue"].(string)
+		host = normalHost(host)
 		if host == "" || net.ParseIP(host) != nil {
 			return ""
 		}
-		return strings.ToLower(host)
+		return host
 	}
 	return ""
 }
@@ -401,7 +428,6 @@ func indexSpans(resources []any) spanGraph {
 	return g
 }
 
-func (g spanGraph) known(id string) bool    { _, ok := g.spans[id]; return ok }
 func (g spanGraph) service(id string) string { return g.spans[id].service }
 func (g spanGraph) of(service string) []string { return g.byService[service] }
 

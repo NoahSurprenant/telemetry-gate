@@ -21,15 +21,24 @@ Settings (flag or environment): `LOKI_URL`, `PROMETHEUS_URL`, `TEMPO_URL` (each 
 cluster-wide (and on `ingressroutes.traefik.io` with `EDGE_SERVICES`).
 
 **Edge services** (`EDGE_SERVICES`, comma-separated, ex. `traefik,edge_processing,origin_fetch`): the ingress and the CDN in
-front of the tenants. A trace fetched by id also keeps, every field, the edge spans a tenant's span sits under, from
-the tenant's span up, while each leads to no other app (through edge spans: no other service's span, no other
-host, no shared id, no cycle, nothing deeper than 64, and no client call whose callee isn't in the trace) and
-names no host but the tenant's, and only when one of them names one of the tenant's hosts (`server.address` on
-Cloudflare's request and Traefik's router): the evidence that it is the tenant's own request. A tenant's hosts
-are the `Host(...)` rules of the Traefik IngressRoutes in its namespace, read from the Kubernetes API (kept 15s);
-when they can't be read, no edge span is kept. Then their edge descendants that lead to no other app and name no
-other host (Cloudflare's firewall and response). Not a chain under another service's span, nor one with a cycle or
-longer than 32 spans. Needs `get` and `list` on `ingressroutes.traefik.io` too. Startup refuses a service in both
+front of the tenants. A trace fetched by id also keeps, every field, the chain of edge spans a tenant's span sits
+under, only when:
+
+- its top (the request's own root: Cloudflare's request, or Traefik's router without Cloudflare) names one of the
+  tenant's hosts in `server.address` (port and trailing dot aside). That is the evidence it is the tenant's request,
+  and a tenant can't forge a span above it;
+- that top starts the trace or sits under the tenant's own span (its browser's): not under another service's span,
+  nor one missing from the trace (sampled out, not ingested, forged);
+- none of it names another host or leads to another app: through edge spans, no other service's span, no other
+  host, no shared id, no cycle, nothing deeper than 64, and no client call whose callee isn't in the trace;
+- it is at most 32 spans long.
+
+Then their edge descendants that lead to no other app and name no other host (Cloudflare's firewall and response).
+
+A tenant's hosts are the `Host(...)` rules (not `!Host`, nor text inside another matcher's argument) of the Traefik
+IngressRoutes in its namespace, read cluster-wide from the Kubernetes API (kept 15s, a failed read 5s). A host more
+than one namespace claims is no one's. When they can't be read, or the trace has no edge span, nothing is read and no
+edge span kept. Needs `get` and `list` on `ingressroutes.traefik.io`, cluster-wide. Startup refuses a service in both
 lists or named like a tenant.
 
 **Downstream services** (`DOWNSTREAM_SERVICES`, comma-separated, ex. `halo-gateway`): services the tenants call. A

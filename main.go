@@ -49,16 +49,13 @@ func main() {
 		log.Error("bad -namespaces", "error", err)
 		os.Exit(2)
 	}
-	pods, err := NewPodResolver(*apiServer, *podSelector, pattern)
+	kube, token, err := kubeClient()
 	if err != nil {
 		log.Error("no Kubernetes API", "error", err)
 		os.Exit(2)
 	}
-	hosts, err := NewIngressRouteHosts(*apiServer)
-	if err != nil {
-		log.Error("no Kubernetes API", "error", err)
-		os.Exit(2)
-	}
+	pods := newPodResolver(*apiServer, *podSelector, pattern, kube, token)
+	hosts := newIngressRouteHosts(*apiServer, kube, token)
 	related := Related{Edge: setOf(*edgeServices), Downstream: setOf(*downstream)}
 	if err := checkRelated(related, pattern); err != nil {
 		log.Error("bad -edge-services or -downstream-services", "error", err)
