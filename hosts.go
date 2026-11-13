@@ -8,7 +8,6 @@ import (
 	"net"
 	"net/http"
 	"strings"
-	"sync"
 	"time"
 )
 
@@ -27,21 +26,23 @@ type IngressRouteHosts struct {
 	client *http.Client
 	token  func() (string, error)
 
-	mu       sync.Mutex
+	// failedTTL keeps a failed read for a while (from when it ends), so a failing API isn't asked again on every trace.
+	failedTTL time.Duration
+
+	// turn is held by the one read at a time (and guards what follows); a caller waiting for it gives up with its
+	// own context
+	turn     chan struct{}
 	byTenant map[string]map[string]bool
 	err      error
 	until    time.Time
 }
-
-// failedTTL keeps a failed read for a while (from when it ends), so a failing API isn't asked again on every trace.
-var failedTTL = 5 * time.Second
 
 // readTimeout bounds one read, which runs on a context of its own: every tenant shares it, so a caller that goes
 // away mustn't cut it short.
 const readTimeout = 10 * time.Second
 
 func newIngressRouteHosts(api string, client *http.Client, token func() (string, error)) *IngressRouteHosts {
-	return &IngressRouteHosts{api: api, client: client, token: token}
+	return &IngressRouteHosts{api: api, client: client, token: token, failedTTL: 5 * time.Second, turn: make(chan struct{}, 1)}
 }
 
 type ingressRouteList struct {
@@ -57,16 +58,24 @@ type ingressRouteList struct {
 	} `json:"items"`
 }
 
-func (h *IngressRouteHosts) Hosts(_ context.Context, tenant string) (map[string]bool, error) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
+func (h *IngressRouteHosts) Hosts(ctx context.Context, tenant string) (map[string]bool, error) {
+	select {
+	case h.turn <- struct{}{}:
+	default:
+		select {
+		case h.turn <- struct{}{}:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	defer func() { <-h.turn }()
 	if time.Now().After(h.until) {
 		ctx, cancel := context.WithTimeout(context.Background(), readTimeout)
 		h.byTenant, h.err = h.lookup(ctx)
 		cancel()
 		ttl := cacheTTL
 		if h.err != nil {
-			ttl = failedTTL
+			ttl = h.failedTTL
 		}
 		h.until = time.Now().Add(ttl)
 	}
@@ -125,26 +134,30 @@ func (h *IngressRouteHosts) lookup(ctx context.Context) (map[string]map[string]b
 }
 
 // routeHosts reads a rule's Host(...) hosts, lower case, without a port or a trailing dot: each Host matcher's
-// quoted arguments, outside any quoted text (another matcher's argument). A rule with a negation (!) anywhere outside
-// quoted text claims nothing: what a negated Host covers isn't the tenant's.
+// quoted arguments, outside any quoted text (another matcher's argument), quoted text read as Traefik reads it (Go:
+// backslash escapes in double quotes, none in backticks). A rule Traefik could read otherwise claims nothing: one
+// with a negation (!) or a comment outside quoted text (what a negated Host covers isn't the tenant's), or with
+// unterminated quoted text. Neither does an argument with an escape, or one that is an address or could be one of the
+// gate's own address names (':', '[', ']', '@').
 func routeHosts(match string) []string {
 	var hosts []string
-	var quote byte
 	for i := 0; i < len(match); i++ {
-		c := match[i]
-		switch {
-		case quote != 0:
-			if c == quote {
-				quote = 0
-			}
+		switch c := match[i]; {
 		case c == '`' || c == '"':
-			quote = c
-		case c == '!':
+			_, end, ok := quoted(match, i)
+			if !ok {
+				return nil
+			}
+			i = end
+		case c == '!' || strings.HasPrefix(match[i:], "/*") || strings.HasPrefix(match[i:], "//"):
 			return nil
 		case strings.HasPrefix(match[i:], "Host(") && (i == 0 || !isIdent(match[i-1])):
-			args, end := quotedArgs(match, i+len("Host("))
+			args, end, ok := quotedArgs(match, i+len("Host("))
+			if !ok {
+				return nil
+			}
 			for _, arg := range args {
-				if host := normalHost(arg); host != "" {
+				if host := normalHost(arg); host != "" && !strings.ContainsAny(host, ":[]@\\") && net.ParseIP(host) == nil {
 					hosts = append(hosts, host)
 				}
 			}
@@ -154,27 +167,47 @@ func routeHosts(match string) []string {
 	return hosts
 }
 
-// quotedArgs reads a matcher's quoted arguments from start up to its closing parenthesis, and where that is.
-func quotedArgs(match string, start int) ([]string, int) {
-	var args []string
-	for i := start; i < len(match); i++ {
-		switch c := match[i]; c {
-		case '`', '"':
-			end := strings.IndexByte(match[i+1:], c)
-			if end < 0 {
-				return args, len(match)
+// quoted reads the quoted text that starts at match[start] (a backtick or a double quote): its content and where it
+// ends; not ok when it doesn't end.
+func quoted(match string, start int) (string, int, bool) {
+	q := match[start]
+	for i := start + 1; i < len(match); i++ {
+		switch match[i] {
+		case '\\':
+			if q == '"' {
+				i++
 			}
-			args = append(args, match[i+1:i+1+end])
-			i += end + 1
-		case ')':
-			return args, i
+		case q:
+			return match[start+1 : i], i, true
 		}
 	}
-	return args, len(match)
+	return "", len(match), false
 }
 
+// quotedArgs reads a matcher's quoted arguments from start up to its closing parenthesis, and where that is; not ok
+// when it doesn't close.
+func quotedArgs(match string, start int) ([]string, int, bool) {
+	var args []string
+	for i := start; i < len(match); i++ {
+		switch match[i] {
+		case '`', '"':
+			arg, end, ok := quoted(match, i)
+			if !ok {
+				return nil, len(match), false
+			}
+			args = append(args, arg)
+			i = end
+		case ')':
+			return args, i, true
+		}
+	}
+	return nil, len(match), false
+}
+
+// isIdent says whether c can be part of an identifier: a letter, a digit or '_', and any byte of a non-ASCII
+// character (Go identifiers may have them).
 func isIdent(c byte) bool {
-	return c == '_' || c >= '0' && c <= '9' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z'
+	return c == '_' || c >= '0' && c <= '9' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= 0x80
 }
 
 // normalHost is a host as hosts are compared: lower case, without a port or a trailing dot.

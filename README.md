@@ -17,7 +17,7 @@ pod's namespace is the tenant; the app's `service.name` must equal it.
 Everything else is a 404, a query that can't be narrowed a 400, an unknown caller a 403. `/healthz` is on 8081.
 
 Settings (flag or environment): `LOKI_URL`, `PROMETHEUS_URL`, `TEMPO_URL` (each unset turns its port off),
-`POD_SELECTOR`, `NAMESPACES`, `TENANT_LABEL` (default `service_name`), `EDGE_SERVICES`, `DOWNSTREAM_SERVICES`. It needs `get` and `list` on pods,
+`POD_SELECTOR`, `NAMESPACES`, `TENANT_LABEL` (default `service_name`), `EDGE_SERVICES`, `DOWNSTREAM_SERVICES`, `DOWNSTREAM_CALLER_ATTRIBUTE`. It needs `get` and `list` on pods,
 cluster-wide (and on `ingressroutes.traefik.io` with `EDGE_SERVICES`).
 
 **Edge services** (`EDGE_SERVICES`, comma-separated, ex. `traefik,edge_processing,origin_fetch`): the ingress and the CDN in
@@ -36,7 +36,8 @@ under, only when:
 Then their edge descendants that lead to no other app and name no other host (Cloudflare's firewall and response).
 
 A tenant's hosts are the `Host(...)` matchers' quoted arguments of the Traefik IngressRoutes in its namespace
-(outside quoted text; a rule with a `!` anywhere outside it claims nothing), read cluster-wide from the Kubernetes
+(read as Traefik reads rules: quoted text with Go escapes; a rule with a `!` or a comment outside quoted text, or
+unterminated quoted text, claims nothing, and so does an argument that is an address or holds `:`, `[`, `]` or `@`), read cluster-wide from the Kubernetes
 API on a context of the gate's own (kept 15s, a failed read 5s from when it ends, one read at a time). A host more
 than one namespace claims is no one's (so a namespace can hide another's edge spans by claiming its host, never show
 its own). An IP address in `server.address` is no host: on a client call (Traefik's proxying) it is ignored, on any
@@ -45,9 +46,11 @@ tenant's, nothing is read and no edge span kept. Needs `get` and `list` on `ingr
 lists or named like a tenant.
 
 **Downstream services** (`DOWNSTREAM_SERVICES`, comma-separated, ex. `halo-gateway`): services the tenants call. A
-trace fetched by id also keeps their spans under the tenant's, through downstream spans only (a gateway reached
-through the ingress is not kept), not under a tenant span one of its own server spans sits under (a caller's span
-id, which the tenant is sent and could copy).
+trace fetched by id also keeps their spans under the tenant's, through downstream spans only, from one whose caller
+attribute (`DOWNSTREAM_CALLER_ATTRIBUTE`, ex. `grunt.api_key`: the gateway's record of the API key it was called
+with) names the tenant. A tenant writes its own span ids and could copy another's to sit over that one's calls; it
+can't make the downstream service name it. Without the attribute no downstream span is kept, and startup refuses
+downstream services without one.
 
 Spans come from every service in a trace, a tenant's included, so a span id two spans share links nothing: one
 could otherwise reuse another's id to sit under or over its spans. With neither setting, a trace keeps only the

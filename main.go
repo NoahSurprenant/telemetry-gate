@@ -39,6 +39,7 @@ func main() {
 		label         = flag.String("label", env("TENANT_LABEL", "service_name"), "the Prometheus and Loki label that carries the tenant")
 		edgeServices  = flag.String("edge-services", env("EDGE_SERVICES", ""), "comma-separated service.names in front of the tenants (ingress, CDN) whose spans a trace keeps where the tenant's sit under them")
 		downstream    = flag.String("downstream-services", env("DOWNSTREAM_SERVICES", ""), "comma-separated service.names the tenants call (a gateway) whose spans a trace keeps under the tenant's")
+		caller        = flag.String("downstream-caller-attribute", env("DOWNSTREAM_CALLER_ATTRIBUTE", ""), "the attribute a downstream service's span names its caller by (ex. grunt.api_key); its spans are kept from one naming the tenant")
 		apiServer     = flag.String("api-server", env("KUBERNETES_API", "https://kubernetes.default.svc"), "the Kubernetes API")
 	)
 	flag.Parse()
@@ -56,7 +57,7 @@ func main() {
 	}
 	pods := newPodResolver(*apiServer, *podSelector, pattern, kube, token)
 	hosts := newIngressRouteHosts(*apiServer, kube, token)
-	related := Related{Edge: setOf(*edgeServices), Downstream: setOf(*downstream)}
+	related := Related{Edge: setOf(*edgeServices), Downstream: setOf(*downstream), Caller: *caller}
 	if err := checkRelated(related, pattern); err != nil {
 		log.Error("bad -edge-services or -downstream-services", "error", err)
 		os.Exit(2)

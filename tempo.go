@@ -30,8 +30,12 @@ type Related struct {
 	// under, and those spans' own edge spans; a search names their roots.
 	Edge map[string]bool
 	// Downstream: the services the tenants call (a gateway to another API). A trace keeps their spans under the
-	// tenant's.
+	// tenant's, from one whose Caller attribute names the tenant.
 	Downstream map[string]bool
+	// Caller: the attribute a downstream service's span names its caller by, set by that service from what the
+	// caller proved (the Halo gateway's grunt.api_key: the name of the API key it was called with). Unset, no
+	// downstream span is kept: a tenant writes its own span ids, so being under one proves nothing.
+	Caller string
 }
 
 const tracePath = "/api/v2/traces/"
@@ -113,6 +117,9 @@ func checkRelated(related Related, namespaces *regexp.Regexp) error {
 		if related.Downstream[name] {
 			return fmt.Errorf("%s is both an edge and a downstream service", name)
 		}
+	}
+	if len(related.Downstream) > 0 && related.Caller == "" {
+		return errors.New("downstream services need a caller attribute (-downstream-caller-attribute): being under a tenant's span proves nothing")
 	}
 	for _, set := range []map[string]bool{related.Edge, related.Downstream} {
 		for name := range set {
@@ -253,7 +260,7 @@ func FilterTrace(body map[string]any, tenant string, related Related, hosts map[
 		return keepResources(trace, resources, tenant, Related{}, nil)
 	}
 
-	g := indexSpans(resources)
+	g := indexSpans(resources, related.Caller)
 	shown := map[string]bool{}
 
 	// Edge: up from each of the tenant's spans through edge spans, each one shown while it leads to no other app,
@@ -297,22 +304,20 @@ func FilterTrace(body map[string]any, tenant string, related Related, hosts map[
 		return related.Edge[g.service(child)] && (host == "" || hosts[host]) && !elsewhere(child)
 	})
 
-	// Downstream: under the tenant's spans; not one a server span of the tenant's sits under, which is how a caller's
-	// span looks (the tenant's server span's parent): a tenant could copy that id, which it is sent, to sit over the
-	// caller's own downstream calls
-	called := map[string]bool{}
-	for _, id := range g.of(tenant) {
-		if g.spans[id].kind == serverKind {
-			called[g.spans[id].parent] = true
-		}
-	}
+	// Downstream: under the tenant's spans, from one naming the tenant as its caller (a tenant could copy another's
+	// span id to sit over that one's calls; it can't make the downstream service name it)
 	var downQueue []string
 	for _, id := range g.of(tenant) {
-		if !g.shared[id] && !called[id] {
+		if !g.shared[id] {
 			downQueue = append(downQueue, id)
 		}
 	}
-	g.descend(downQueue, shown, func(child string) bool { return related.Downstream[g.service(child)] })
+	g.descend(downQueue, shown, func(child string) bool {
+		if related.Caller == "" || !related.Downstream[g.service(child)] {
+			return false
+		}
+		return g.service(g.spans[child].parent) != tenant || g.spans[child].caller == tenant
+	})
 
 	return keepResources(trace, resources, tenant, related, shown)
 }
@@ -386,24 +391,13 @@ func (g spanGraph) leadsElsewhere(tenant string, edge, hosts map[string]bool) fu
 	}
 }
 
-const (
-	clientKind = "SPAN_KIND_CLIENT"
-	serverKind = "SPAN_KIND_SERVER"
-)
+const clientKind = "SPAN_KIND_CLIENT"
 
 // hostOf reads a span's server.address as a host: lower case, without a port or a trailing dot; "" for none, or an
 // address on a client call (Traefik's proxying to a pod, whose callee's own spans say whose it is). An address on
 // any other span is another origin's, named so it matches no tenant's host.
 func hostOf(span map[string]any, kind string) string {
-	attrs, _ := span["attributes"].([]any)
-	for _, a := range attrs {
-		attr, _ := a.(map[string]any)
-		if attr["key"] != "server.address" {
-			continue
-		}
-		value, _ := attr["value"].(map[string]any)
-		host, _ := value["stringValue"].(string)
-		host = normalHost(host)
+	if host := normalHost(attribute(span, "server.address")); host != "" {
 		if net.ParseIP(host) != nil {
 			if kind == clientKind {
 				return ""
@@ -411,6 +405,20 @@ func hostOf(span map[string]any, kind string) string {
 			return "address:" + host
 		}
 		return host
+	}
+	return ""
+}
+
+// attribute reads a span's string attribute; "" when it has none.
+func attribute(span map[string]any, key string) string {
+	attrs, _ := span["attributes"].([]any)
+	for _, a := range attrs {
+		attr, _ := a.(map[string]any)
+		if attr["key"] == key {
+			value, _ := attr["value"].(map[string]any)
+			v, _ := value["stringValue"].(string)
+			return v
+		}
 	}
 	return ""
 }
@@ -426,9 +434,10 @@ type spanGraph struct {
 
 // spanRef is a span as the filter sees it: host is the server.address it names, when that is a host name (Cloudflare's
 // request, Traefik's router; not Traefik's proxying, which names the pod's address).
-type spanRef struct{ parent, service, kind, host string }
+// caller is the value of Related.Caller on it (a downstream service's record of who called it).
+type spanRef struct{ parent, service, kind, host, caller string }
 
-func indexSpans(resources []any) spanGraph {
+func indexSpans(resources []any, callerAttribute string) spanGraph {
 	g := spanGraph{spans: map[string]spanRef{}, children: map[string][]string{}, shared: map[string]bool{}, byService: map[string][]string{}}
 	for _, rs := range resources {
 		service := serviceName(rs)
@@ -442,7 +451,11 @@ func indexSpans(resources []any) spanGraph {
 			if _, seen := g.spans[id]; seen {
 				g.shared[id] = true
 			}
-			g.spans[id] = spanRef{parent, service, kind, hostOf(span, kind)}
+			caller := ""
+			if callerAttribute != "" {
+				caller = attribute(span, callerAttribute)
+			}
+			g.spans[id] = spanRef{parent, service, kind, hostOf(span, kind), caller}
 			g.children[parent] = append(g.children[parent], id)
 			g.byService[service] = append(g.byService[service], id)
 		}

@@ -703,8 +703,11 @@ func TestTempoTraceShowsNoEdgeSpansWhenTheHostsCantBeRead(t *testing.T) {
 
 func TestCheckRelated(t *testing.T) {
 	namespaces := regexp.MustCompile(`^grif-(prod|test)$`)
-	if err := checkRelated(Related{Edge: map[string]bool{"traefik": true}, Downstream: map[string]bool{"halo-gateway": true}}, namespaces); err != nil {
+	if err := checkRelated(Related{Edge: map[string]bool{"traefik": true}, Downstream: map[string]bool{"halo-gateway": true}, Caller: "grunt.api_key"}, namespaces); err != nil {
 		t.Errorf("valid: %v", err)
+	}
+	if err := checkRelated(Related{Downstream: map[string]bool{"halo-gateway": true}}, namespaces); err == nil {
+		t.Error("downstream services without a caller attribute are accepted")
 	}
 	if err := checkRelated(Related{Edge: map[string]bool{"traefik": true}, Downstream: map[string]bool{"traefik": true}}, namespaces); err == nil {
 		t.Error("a service in both lists is accepted")
