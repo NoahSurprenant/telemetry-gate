@@ -260,7 +260,7 @@ func FilterTrace(body map[string]any, tenant string, related Related, hosts map[
 		return keepResources(trace, resources, tenant, Related{}, nil)
 	}
 
-	g := indexSpans(resources, related.Caller)
+	g := indexSpans(resources, related)
 	shown := map[string]bool{}
 
 	// Edge: up from each of the tenant's spans through edge spans, each one shown while it leads to no other app,
@@ -316,7 +316,13 @@ func FilterTrace(body map[string]any, tenant string, related Related, hosts map[
 		if related.Caller == "" || !related.Downstream[g.service(child)] {
 			return false
 		}
-		return g.service(g.spans[child].parent) != tenant || g.spans[child].caller == tenant
+		// Each hop names the tenant or no one (the gateway's own inner spans); the first one, under the tenant's span,
+		// must name it
+		caller := g.spans[child].caller
+		if g.service(g.spans[child].parent) == tenant {
+			return caller == tenant
+		}
+		return caller == "" || caller == tenant
 	})
 
 	return keepResources(trace, resources, tenant, related, shown)
@@ -437,7 +443,7 @@ type spanGraph struct {
 // caller is the value of Related.Caller on it (a downstream service's record of who called it).
 type spanRef struct{ parent, service, kind, host, caller string }
 
-func indexSpans(resources []any, callerAttribute string) spanGraph {
+func indexSpans(resources []any, related Related) spanGraph {
 	g := spanGraph{spans: map[string]spanRef{}, children: map[string][]string{}, shared: map[string]bool{}, byService: map[string][]string{}}
 	for _, rs := range resources {
 		service := serviceName(rs)
@@ -452,8 +458,8 @@ func indexSpans(resources []any, callerAttribute string) spanGraph {
 				g.shared[id] = true
 			}
 			caller := ""
-			if callerAttribute != "" {
-				caller = spanAttribute(span, callerAttribute)
+			if related.Caller != "" && related.Downstream[service] {
+				caller = spanAttribute(span, related.Caller)
 			}
 			g.spans[id] = spanRef{parent, service, kind, hostOf(span, kind), caller}
 			g.children[parent] = append(g.children[parent], id)

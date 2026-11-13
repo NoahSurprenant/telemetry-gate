@@ -108,9 +108,20 @@ func (h *IngressRouteHosts) lookup(ctx context.Context) (map[string]map[string]b
 		return nil, err
 	}
 	claims := map[string]map[string]bool{}
+	readable := map[string]map[string]bool{}
 	for _, item := range list.Items {
 		for _, route := range item.Spec.Routes {
 			for _, host := range routeHosts(route.Match) {
+				if readable[item.Metadata.Namespace] == nil {
+					readable[item.Metadata.Namespace] = map[string]bool{}
+				}
+				readable[item.Metadata.Namespace][host] = true
+			}
+		}
+	}
+	for _, item := range list.Items {
+		for _, route := range item.Spec.Routes {
+			for _, host := range ruleClaims(route.Match) {
 				if claims[host] == nil {
 					claims[host] = map[string]bool{}
 				}
@@ -124,6 +135,9 @@ func (h *IngressRouteHosts) lookup(ctx context.Context) (map[string]map[string]b
 			continue
 		}
 		for namespace := range namespaces {
+			if !readable[namespace][host] {
+				continue
+			}
 			if byTenant[namespace] == nil {
 				byTenant[namespace] = map[string]bool{}
 			}
@@ -140,21 +154,46 @@ func (h *IngressRouteHosts) lookup(ctx context.Context) (map[string]map[string]b
 // unterminated quoted text. Neither does an argument with an escape, or one that is an address or could be one of the
 // gate's own address names (':', '[', ']', '@').
 func routeHosts(match string) []string {
+	hosts, _ := readHosts(match)
+	return hosts
+}
+
+// ruleClaims is what a rule claims, for which hosts one namespace alone claims: its hosts, or for a rule the gate
+// can't read every quoted string in it (what it might route: claiming more only makes fewer hosts anyone's).
+func ruleClaims(match string) []string {
+	if hosts, ok := readHosts(match); ok {
+		return hosts
+	}
+	var claims []string
+	for i := 0; i < len(match); i++ {
+		if c := match[i]; c == '`' || c == '"' {
+			text, end, _ := quoted(match, i)
+			if host := normalHost(text); host != "" {
+				claims = append(claims, host)
+			}
+			i = end
+		}
+	}
+	return claims
+}
+
+// readHosts reads a rule's hosts as routeHosts does, and whether the gate could read it.
+func readHosts(match string) ([]string, bool) {
 	var hosts []string
 	for i := 0; i < len(match); i++ {
 		switch c := match[i]; {
 		case c == '`' || c == '"':
 			_, end, ok := quoted(match, i)
 			if !ok {
-				return nil
+				return nil, false
 			}
 			i = end
 		case c == '!' || strings.HasPrefix(match[i:], "/*") || strings.HasPrefix(match[i:], "//"):
-			return nil
+			return nil, false
 		case strings.HasPrefix(match[i:], "Host(") && (i == 0 || !isIdent(match[i-1])):
 			args, end, ok := quotedArgs(match, i+len("Host("))
 			if !ok {
-				return nil
+				return nil, false
 			}
 			for _, arg := range args {
 				if host := normalHost(arg); host != "" && !strings.ContainsAny(host, ":[]@\\") && net.ParseIP(host) == nil {
@@ -164,7 +203,7 @@ func routeHosts(match string) []string {
 			i = end
 		}
 	}
-	return hosts
+	return hosts, true
 }
 
 // quoted reads the quoted text that starts at match[start] (a backtick or a double quote): its content and where it
@@ -199,6 +238,12 @@ func quotedArgs(match string, start int) ([]string, int, bool) {
 			i = end
 		case ')':
 			return args, i, true
+		case '!':
+			return nil, len(match), false
+		case '/':
+			if i+1 < len(match) && (match[i+1] == '*' || match[i+1] == '/') {
+				return nil, len(match), false
+			}
 		}
 	}
 	return nil, len(match), false

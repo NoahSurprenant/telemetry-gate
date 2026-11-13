@@ -36,8 +36,10 @@ under, only when:
 Then their edge descendants that lead to no other app and name no other host (Cloudflare's firewall and response).
 
 A tenant's hosts are the `Host(...)` matchers' quoted arguments of the Traefik IngressRoutes in its namespace
-(read as Traefik reads rules: quoted text with Go escapes; a rule with a `!` or a comment outside quoted text, or
-unterminated quoted text, claims nothing, and so does an argument that is an address or holds `:`, `[`, `]` or `@`), read cluster-wide from the Kubernetes
+(read as Traefik reads rules: quoted text with Go escapes; a rule with a `!` or a comment outside quoted text,
+anywhere in it, or unterminated quoted text, gives no hosts, and neither does an argument that is an address or holds
+`:`, `[`, `]`, `@` or an escape. Such a rule still claims every quoted string in it, so a host it might route is no
+one's), read cluster-wide from the Kubernetes
 API on a context of the gate's own (kept 15s, a failed read 5s from when it ends, one read at a time). A host more
 than one namespace claims is no one's (so a namespace can hide another's edge spans by claiming its host, never show
 its own). An IP address in `server.address` is no host: on a client call (Traefik's proxying) it is ignored, on any
@@ -48,9 +50,10 @@ lists or named like a tenant.
 **Downstream services** (`DOWNSTREAM_SERVICES`, comma-separated, ex. `halo-gateway`): services the tenants call. A
 trace fetched by id also keeps their spans under the tenant's, through downstream spans only, from one whose caller
 attribute (`DOWNSTREAM_CALLER_ATTRIBUTE`, ex. `grunt.api_key`: the gateway's record of the API key it was called
-with) names the tenant. A tenant writes its own span ids and could copy another's to sit over that one's calls; it
+with) names the tenant, and each hop below it names the tenant or no one. A tenant writes its own span ids and could copy another's to sit over that one's calls; it
 can't make the downstream service name it. Without the attribute no downstream span is kept, and startup refuses
-downstream services without one.
+downstream services without one. The Halo gateway's key names are grif-prod, grif-staging and grif-test; the PR
+previews share one key (grif-previews, not their namespace), so a preview sees no gateway spans.
 
 Spans come from every service in a trace, a tenant's included, so a span id two spans share links nothing: one
 could otherwise reuse another's id to sit under or over its spans. With neither setting, a trace keeps only the

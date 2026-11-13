@@ -569,8 +569,10 @@ func TestIngressRouteHosts(t *testing.T) {
 			t.Errorf("%s missing from %v", host, got)
 		}
 	}
-	if prod, _ := h.Hosts(context.Background(), "grif-prod"); len(prod) != 1 || !prod["grif.prod"] {
-		t.Errorf("prod: %v (a host two namespaces claim is neither's)", prod)
+	// grif-test's unreadable !Host(grif.prod) still claims it, and grif-test and grif-prod both claim shared.example:
+	// neither is anyone's
+	if prod, _ := h.Hosts(context.Background(), "grif-prod"); len(prod) != 0 {
+		t.Errorf("prod: %v", prod)
 	}
 	if calls != 1 {
 		t.Errorf("one cluster-wide read, cached: %d calls", calls)
