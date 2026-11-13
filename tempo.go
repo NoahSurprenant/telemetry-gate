@@ -180,10 +180,11 @@ func FilterSearch(body map[string]any, tenant string) bool {
 
 // FilterTrace keeps a trace's resource spans whose service.name is the tenant, and of the related services' spans
 // only those of the tenant's own requests (false when the tenant has no spans):
-//   - edge: the chain of edge spans a tenant's span sits under, when the chain starts the trace or sits under the
-//     tenant's own span (its browser's), not under another service's (another app calling the tenant through the
-//     ingress); and those spans' edge descendants that lead to no other service (Cloudflare's firewall and response,
-//     not a second origin fetch for another app);
+//   - edge: up the chain of edge spans a tenant's span sits under, each span while it leads to no other app
+//     (leadsElsewhere: so not the Cloudflare request of a second origin fetch for another app), when the chain
+//     starts the trace or sits under the tenant's own span (its browser's), not another service's (another app
+//     calling the tenant through the ingress); and those spans' edge descendants that lead to no other app
+//     (Cloudflare's firewall and response). A cycle or a chain longer than maxEdgeChain shows nothing;
 //   - downstream: the spans under the tenant's, through downstream spans only (the Halo gateway's).
 //
 // A span id two spans share links nothing: the trace's spans come from its services, a tenant's included, so one
@@ -201,55 +202,36 @@ func FilterTrace(body map[string]any, tenant string, related Related) bool {
 	g := indexSpans(resources)
 	shown := map[string]bool{}
 
-	// Edge: the chains above the tenant's spans that are the tenant's requests', and their edge descendants
+	// Edge: up from each of the tenant's spans through edge spans, each one shown while it leads to no other app,
+	// unless the chain sits under another service's span; then their edge descendants that lead to no other app
+	elsewhere := g.leadsElsewhere(tenant, related.Edge)
 	var edgeQueue []string
 	for _, id := range g.of(tenant) {
 		if g.shared[id] {
 			continue
 		}
 		var chain []string
+		seen := map[string]bool{}
 		top := g.spans[id].parent
-		for top != "" && !g.shared[top] && related.Edge[g.service(top)] {
+		for top != "" && related.Edge[g.service(top)] && !g.shared[top] && !seen[top] && len(chain) < maxEdgeChain {
+			seen[top] = true
 			chain = append(chain, top)
 			top = g.spans[top].parent
 		}
-		if top != "" && g.known(top) && (g.shared[top] || g.service(top) != tenant) {
+		// A cycle, a chain too long, a shared id, or another service's span above: nothing of this chain
+		if seen[top] || g.shared[top] || (top != "" && related.Edge[g.service(top)]) || (g.known(top) && g.service(top) != tenant) {
 			continue
 		}
 		for _, edgeID := range chain {
+			if elsewhere(edgeID) {
+				break
+			}
 			if !shown[edgeID] {
 				shown[edgeID] = true
 				edgeQueue = append(edgeQueue, edgeID)
 			}
 		}
 	}
-	leadsElsewhere := map[string]bool{}
-	var visiting map[string]bool
-	var elsewhere func(id string) bool
-	elsewhere = func(id string) bool {
-		if v, done := leadsElsewhere[id]; done {
-			return v
-		}
-		if visiting[id] {
-			return true // a cycle: no tree, so nothing to show
-		}
-		visiting[id] = true
-		result := false
-		for _, child := range g.children[id] {
-			switch service := g.service(child); {
-			case g.shared[child]:
-				result = true
-			case service == tenant:
-			case related.Edge[service]:
-				result = result || elsewhere(child)
-			default:
-				result = true
-			}
-		}
-		leadsElsewhere[id] = result
-		return result
-	}
-	visiting = map[string]bool{}
 	g.descend(edgeQueue, shown, func(child string) bool {
 		return related.Edge[g.service(child)] && !elsewhere(child)
 	})
@@ -266,6 +248,49 @@ func FilterTrace(body map[string]any, tenant string, related Related) bool {
 	return keepResources(trace, resources, tenant, related, shown)
 }
 
+// maxEdgeChain caps the edge spans walked up from one of the tenant's spans: a real chain (Cloudflare's, then
+// Traefik's) is a handful deep, and a longer one (forged) shows nothing.
+const maxEdgeChain = 32
+
+// leadsElsewhere answers, for an edge span, whether anything under it is another app's: through edge spans, a span
+// of a service neither the tenant nor an edge one, a shared id, a cycle, or a client call (Traefik's proxying) whose
+// callee isn't in the trace (not ingested yet, sampled out, untraced). The tenant's spans end the search.
+func (g spanGraph) leadsElsewhere(tenant string, edge map[string]bool) func(id string) bool {
+	known := map[string]bool{}
+	visiting := map[string]bool{}
+	var elsewhere func(id string) bool
+	elsewhere = func(id string) bool {
+		if v, done := known[id]; done {
+			return v
+		}
+		if visiting[id] {
+			return true
+		}
+		visiting[id] = true
+		children := g.children[id]
+		result := len(children) == 0 && g.spans[id].kind == clientKind
+		for _, child := range children {
+			if result {
+				break
+			}
+			switch service := g.service(child); {
+			case g.shared[child]:
+				result = true
+			case service == tenant:
+			case edge[service]:
+				result = elsewhere(child)
+			default:
+				result = true
+			}
+		}
+		known[id] = result
+		return result
+	}
+	return elsewhere
+}
+
+const clientKind = "SPAN_KIND_CLIENT"
+
 // spanGraph indexes a trace's spans by id: each one's parent and service, its children, and the ids more than one
 // span has (shared, linked to nothing).
 type spanGraph struct {
@@ -275,7 +300,7 @@ type spanGraph struct {
 	byService map[string][]string
 }
 
-type spanRef struct{ parent, service string }
+type spanRef struct{ parent, service, kind string }
 
 func indexSpans(resources []any) spanGraph {
 	g := spanGraph{spans: map[string]spanRef{}, children: map[string][]string{}, shared: map[string]bool{}, byService: map[string][]string{}}
@@ -287,10 +312,11 @@ func indexSpans(resources []any) spanGraph {
 				continue
 			}
 			parent, _ := span["parentSpanId"].(string)
+			kind, _ := span["kind"].(string)
 			if _, seen := g.spans[id]; seen {
 				g.shared[id] = true
 			}
-			g.spans[id] = spanRef{parent, service}
+			g.spans[id] = spanRef{parent, service, kind}
 			g.children[parent] = append(g.children[parent], id)
 			g.byService[service] = append(g.byService[service], id)
 		}
