@@ -21,10 +21,12 @@ Settings (flag or environment): `LOKI_URL`, `PROMETHEUS_URL`, `TEMPO_URL` (each 
 cluster-wide.
 
 **Edge services** (`EDGE_SERVICES`, comma-separated, ex. `traefik,edge_processing,origin_fetch`): the ingress and the CDN in
-front of the tenants. A trace fetched by id also keeps, every field, the chain of edge spans a tenant's span sits
-under when that chain starts the trace or sits under the tenant's own span (its browser's), and those spans' edge
-descendants that lead to no other service (Cloudflare's firewall and response). Not a chain under another service's
-span (another app calling the tenant through the ingress), and not a second origin fetch for another app.
+front of the tenants. A trace fetched by id also keeps, every field, the edge spans a tenant's span sits under, from
+the tenant's span up, while each leads to no other app: through edge spans, no other service's span, no shared id,
+no cycle, and no client call (Traefik's proxying) whose callee isn't in the trace (not ingested yet, sampled out,
+untraced). So a Cloudflare request that also fetched from another app is not kept. And their edge descendants that
+lead to no other app (Cloudflare's firewall and response). Not a chain under another service's span (another app
+calling the tenant through the ingress), nor one with a cycle or longer than 32 spans.
 
 **Downstream services** (`DOWNSTREAM_SERVICES`, comma-separated, ex. `halo-gateway`): services the tenants call. A
 trace fetched by id also keeps their spans under the tenant's, through downstream spans only (a gateway reached
