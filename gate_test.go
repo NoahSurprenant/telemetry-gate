@@ -375,7 +375,7 @@ const duplicateIDJSON = `{"trace":{"resourceSpans":[
 	{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"grif-test"}}]},"scopeSpans":[{"spans":[
 		{"spanId":"p1","name":"forged"}]}]},
 	{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"halo-gateway"}}]},"scopeSpans":[{"spans":[
-		{"spanId":"h1","parentSpanId":"p1","name":"prod gateway secret"}]}]}
+		{"spanId":"h1","parentSpanId":"p1","name":"prod gateway secret","attributes":[{"key":"grunt.api_key","value":{"stringValue":"grif-test"}}]}]}]}
 ]}}`
 
 // A second origin fetch whose app's spans aren't in the trace (not yet ingested, sampled out or untraced): its
@@ -665,8 +665,8 @@ func TestFilterTraceKeepsNoDownstreamSpanUnderACallersCopiedSpan(t *testing.T) {
 			{"spanId":"p9","name":"copied","kind":"SPAN_KIND_CLIENT"},
 			{"spanId":"g","parentSpanId":"p9","name":"mine","kind":"SPAN_KIND_SERVER"}]}]},
 		{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"halo-gateway"}}]},"scopeSpans":[{"spans":[
-			{"spanId":"h","parentSpanId":"p9","name":"prod gateway secret"}]}]}]}}`), &body)
-	FilterTrace(body, "grif-test", Related{Downstream: map[string]bool{"halo-gateway": true}}, testHosts)
+			{"spanId":"h","parentSpanId":"p9","name":"prod gateway secret","attributes":[{"key":"grunt.api_key","value":{"stringValue":"grif-prod"}}]}]}]}]}`), &body)
+	FilterTrace(body, "grif-test", Related{Downstream: map[string]bool{"halo-gateway": true}, Caller: "grunt.api_key"}, testHosts)
 	if out, _ := json.Marshal(body); strings.Contains(string(out), "secret") {
 		t.Errorf("got %s", out)
 	}
@@ -720,7 +720,7 @@ func TestCheckRelated(t *testing.T) {
 func TestFilterTraceFollowsNoSpanIDTwoSpansShare(t *testing.T) {
 	var body map[string]any
 	json.Unmarshal([]byte(duplicateIDJSON), &body)
-	FilterTrace(body, "grif-test", Related{Downstream: map[string]bool{"halo-gateway": true}}, testHosts)
+	FilterTrace(body, "grif-test", Related{Downstream: map[string]bool{"halo-gateway": true}, Caller: "grunt.api_key"}, testHosts)
 	if out, _ := json.Marshal(body); strings.Contains(string(out), "secret") {
 		t.Errorf("a span under a shared id left in: %s", out)
 	}
