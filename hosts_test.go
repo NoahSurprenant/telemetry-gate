@@ -58,6 +58,47 @@ func TestIngressRouteHostsCountsAnUnreadableRulesHostsAsClaimed(t *testing.T) {
 	}
 }
 
+// A host a rule only excludes (!Host) is one it never routes: another namespace's catch-all that leaves out the
+// tenant's host (link-preview's) doesn't make that host no one's.
+func TestIngressRouteHostsLeavesAHostARuleOnlyExcludes(t *testing.T) {
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"items":[
+			{"metadata":{"namespace":"link-preview"},"spec":{"routes":[{"match":"HostRegexp(`^.+\\.example$`) && !Host(`a.example`) && ! Host(`b.example`, \"c.example\") && HeaderRegexp(`User-Agent`, `Discordbot`)"}]}},
+			{"metadata":{"namespace":"grif-test"},"spec":{"routes":[{"match":"Host(`b.example`)"}]}}]}`))
+	}))
+	defer api.Close()
+	h := newIngressRouteHosts(api.URL, api.Client(), func() (string, error) { return "token", nil })
+	if hosts, err := h.Hosts(context.Background(), "grif-test"); err != nil || !hosts["b.example"] {
+		t.Errorf("got %v %v", hosts, err)
+	}
+}
+
+// ruleClaims leaves out only the arguments of a Host a rule plainly excludes (a ! right before it): a negated group,
+// a double negation or a comment, and the rule claims every quoted string in it as before.
+func TestRuleClaims(t *testing.T) {
+	cases := []struct {
+		rule string
+		want []string
+	}{
+		{"Host(`a.example`)", []string{"a.example"}},
+		{"PathPrefix(`/x`) && !Host(`a.example`, \"b.example\")", []string{"/x"}},
+		{"!Host(`a.example`) || Host(`b.example`)", []string{"b.example"}},
+		{"Path(\"!Host(\\\"\") && !Host(`a.example`)", []string{"!host(\\\""}},
+		{"!(Host(`a.example`))", []string{"a.example"}},
+		{"!!Host(`a.example`)", []string{"a.example"}},
+		{"! !Host(`a.example`)", []string{"a.example"}},
+		{"!xHost(`a.example`)", []string{"a.example"}},
+		{"!Host(`a.example`) /* */", []string{"a.example"}},
+		{"!Host(`a.example` /* ) */)", []string{"a.example"}},
+		{"!Host(`a.example`", []string{"a.example"}},
+	}
+	for _, c := range cases {
+		if got := ruleClaims(c.rule); !slices.Equal(got, c.want) {
+			t.Errorf("%s: got %q, want %q", c.rule, got, c.want)
+		}
+	}
+}
+
 func TestIngressRouteHostsKeepsAFailedReadFromWhenItEnds(t *testing.T) {
 	const ttl = 50 * time.Millisecond
 	calls := 0
