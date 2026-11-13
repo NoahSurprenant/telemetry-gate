@@ -307,25 +307,76 @@ func TestFilterTraceKeepsTheDownstreamSpansUnderTheTenants(t *testing.T) {
 	}
 }
 
-func TestFilterSearchNamesTheEdgesRoots(t *testing.T) {
+func TestFilterSearchNamesOnlyTheTenantsRootAndCounts(t *testing.T) {
 	var body map[string]any
-	json.Unmarshal([]byte(`{"traces":[{"traceID":"a","rootServiceName":"edge_processing","rootTraceName":"cloudflare_request",
-		"serviceStats":{"grif-test":{"spanCount":1},"edge_processing":{"spanCount":4},"other-app":{"spanCount":1}}}]}`), &body)
-	FilterSearch(body, "grif-test", Related{Edge: map[string]bool{"edge_processing": true}})
+	json.Unmarshal([]byte(`{"traces":[{"traceID":"a","rootServiceName":"edge_processing","rootTraceName":"another app's request",
+		"serviceStats":{"grif-test":{"spanCount":1},"edge_processing":{"spanCount":4},"halo-gateway":{"spanCount":2}}}]}`), &body)
+	FilterSearch(body, "grif-test", Related{Edge: map[string]bool{"edge_processing": true}, Downstream: map[string]bool{"halo-gateway": true}})
 	out, _ := json.Marshal(body)
-	if !strings.Contains(string(out), `"rootTraceName":"cloudflare_request"`) || !strings.Contains(string(out), `"edge_processing":{"spanCount":4}`) {
-		t.Errorf("the edge's root or stats removed: %s", out)
+	if strings.Contains(string(out), "another app's request") || strings.Contains(string(out), "edge_processing") || strings.Contains(string(out), "halo-gateway") {
+		t.Errorf("a root or count that may be another request's left in: %s", out)
 	}
-	if strings.Contains(string(out), "other-app") {
-		t.Errorf("another service's stats left in: %s", out)
+	if !strings.Contains(string(out), `"grif-test":{"spanCount":1}`) {
+		t.Errorf("the tenant's count removed: %s", out)
 	}
+}
 
-	json.Unmarshal([]byte(`{"traces":[{"traceID":"a","rootServiceName":"halo-gateway","rootTraceName":"x",
-		"serviceStats":{"grif-test":{"spanCount":1},"halo-gateway":{"spanCount":2}}}]}`), &body)
-	FilterSearch(body, "grif-test", Related{Downstream: map[string]bool{"halo-gateway": true}})
-	out, _ = json.Marshal(body)
-	if strings.Contains(string(out), "rootServiceName") || !strings.Contains(string(out), `"halo-gateway":{"spanCount":2}`) {
-		t.Errorf("a downstream root named, or its stats removed: %s", out)
+// Edge spans and the requests they belong to: one Cloudflare request fetching from two origins (grif-test and
+// grif-prod), grif-prod calling grif-test through Traefik, and grif-test's browser span above Cloudflare's.
+const edgeLeakJSON = `{"trace":{"resourceSpans":[
+	{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"edge_processing"}}]},"scopeSpans":[{"spans":[
+		{"spanId":"cf1","parentSpanId":"b1","name":"cloudflare_request"},
+		{"spanId":"cf2","parentSpanId":"cf1","name":"response"}]}]},
+	{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"origin_fetch"}}]},"scopeSpans":[{"spans":[
+		{"spanId":"of1","parentSpanId":"cf1","name":"origin"},
+		{"spanId":"of2","parentSpanId":"cf1","name":"prod origin secret"}]}]},
+	{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"traefik"}}]},"scopeSpans":[{"spans":[
+		{"spanId":"t1","parentSpanId":"of1","name":"router"},
+		{"spanId":"t5","parentSpanId":"of2","name":"prod router secret"},
+		{"spanId":"t6","parentSpanId":"p2","name":"prod call secret"}]}]},
+	{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"grif-test"}}]},"scopeSpans":[{"spans":[
+		{"spanId":"b1","name":"browser click"},
+		{"spanId":"g1","parentSpanId":"t1","name":"GET x"},
+		{"spanId":"g9","parentSpanId":"t6","name":"called by prod"}]}]},
+	{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"grif-prod"}}]},"scopeSpans":[{"spans":[
+		{"spanId":"p1","parentSpanId":"t5","name":"prod request"},
+		{"spanId":"p2","parentSpanId":"p1","name":"prod call"}]}]}
+]}}`
+
+func TestFilterTraceKeepsOnlyTheEdgeSpansOfTheTenantsOwnRequests(t *testing.T) {
+	edge := map[string]bool{"edge_processing": true, "origin_fetch": true, "traefik": true}
+	var body map[string]any
+	json.Unmarshal([]byte(edgeLeakJSON), &body)
+	if !FilterTrace(body, "grif-test", Related{Edge: edge}) {
+		t.Fatal("want kept")
+	}
+	out, _ := json.Marshal(body)
+	for _, name := range []string{"cloudflare_request", "response", "origin", "router", "GET x", "browser click", "called by prod"} {
+		if !strings.Contains(string(out), `"`+name+`"`) {
+			t.Errorf("%s removed: %s", name, out)
+		}
+	}
+	if strings.Contains(string(out), "secret") {
+		t.Errorf("another request's edge span left in: %s", out)
+	}
+}
+
+// grif-test reuses grif-prod's span id p1, under which the Halo gateway serves prod's request.
+const duplicateIDJSON = `{"trace":{"resourceSpans":[
+	{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"grif-test"}}]},"scopeSpans":[{"spans":[
+		{"spanId":"p1","name":"forged"}]}]},
+	{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"grif-prod"}}]},"scopeSpans":[{"spans":[
+		{"spanId":"p1","name":"prod request"}]}]},
+	{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"halo-gateway"}}]},"scopeSpans":[{"spans":[
+		{"spanId":"h1","parentSpanId":"p1","name":"prod gateway secret"}]}]}
+]}}`
+
+func TestFilterTraceFollowsNoSpanIDTwoSpansShare(t *testing.T) {
+	var body map[string]any
+	json.Unmarshal([]byte(duplicateIDJSON), &body)
+	FilterTrace(body, "grif-test", Related{Downstream: map[string]bool{"halo-gateway": true}})
+	if out, _ := json.Marshal(body); strings.Contains(string(out), "secret") {
+		t.Errorf("a span under a shared id left in: %s", out)
 	}
 }
 
