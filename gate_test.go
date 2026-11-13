@@ -589,7 +589,8 @@ func TestIngressRouteHosts(t *testing.T) {
 }
 
 func TestIngressRouteHostsKeepsAFailedReadFromWhenItEnds(t *testing.T) {
-	failedTTL, failedTTLWas := 50*time.Millisecond, failedTTL
+	failedTTLWas := failedTTL
+	failedTTL = 50 * time.Millisecond
 	defer func() { failedTTL = failedTTLWas }()
 	calls := 0
 	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
