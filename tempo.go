@@ -10,9 +10,12 @@ import (
 )
 
 // Tempo allows a TraceQL search, narrowed to the tenant's spans, and fetching a trace by id, cut down to the tenant's
-// spans. The tenant is resource.service.name.
+// spans and the edge spans that lead to them. The tenant is resource.service.name.
 type Tempo struct {
 	Gate
+	// Edge holds the service.names in front of the tenants (the ingress, the CDN): a trace keeps their spans that its
+	// tenant's spans sit under, and those spans' own edge spans (FilterTrace), and a search names their roots.
+	Edge map[string]bool
 }
 
 const tracePath = "/api/v2/traces/"
@@ -46,7 +49,7 @@ func (t *Tempo) search(w http.ResponseWriter, r *http.Request) {
 	}
 	kept := only(values, "start", "end", "limit", "spss", "minDuration", "maxDuration")
 	kept.Set("q", q)
-	t.filter(w, r, tenant, r.URL.Path, kept, func(body map[string]any) bool { return FilterSearch(body, tenant) })
+	t.filter(w, r, tenant, r.URL.Path, kept, func(body map[string]any) bool { return FilterSearch(body, tenant, t.Edge) })
 }
 
 func (t *Tempo) trace(w http.ResponseWriter, r *http.Request) {
@@ -58,7 +61,7 @@ func (t *Tempo) trace(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	t.filter(w, r, tenant, r.URL.Path, only(r.URL.Query(), "start", "end"), func(body map[string]any) bool { return FilterTrace(body, tenant) })
+	t.filter(w, r, tenant, r.URL.Path, only(r.URL.Query(), "start", "end"), func(body map[string]any) bool { return FilterTrace(body, tenant, t.Edge) })
 }
 
 // filter reads the upstream's JSON answer and sends it on after keep; keep false is a 404.
@@ -138,9 +141,9 @@ func EnforceTraceQL(query, tenant string) (string, error) {
 }
 
 // FilterSearch keeps what a search may say about other services: a trace's root is named only when it is the
-// tenant's, and the per-service counts keep the tenant's. The matched spans are the tenant's already. False when
-// the answer isn't a search's.
-func FilterSearch(body map[string]any, tenant string) bool {
+// tenant's or an edge service's (every trace found has the tenant's spans), and the per-service counts keep the
+// tenant's and the edge's. The matched spans are the tenant's already. False when the answer isn't a search's.
+func FilterSearch(body map[string]any, tenant string, edge map[string]bool) bool {
 	traces, ok := body["traces"].([]any)
 	if !ok {
 		_, has := body["traces"]
@@ -151,13 +154,13 @@ func FilterSearch(body map[string]any, tenant string) bool {
 		if !ok {
 			continue
 		}
-		if trace["rootServiceName"] != tenant {
+		if root, _ := trace["rootServiceName"].(string); root != tenant && !edge[root] {
 			delete(trace, "rootServiceName")
 			delete(trace, "rootTraceName")
 		}
 		if stats, ok := trace["serviceStats"].(map[string]any); ok {
 			for service := range stats {
-				if service != tenant {
+				if service != tenant && !edge[service] {
 					delete(stats, service)
 				}
 			}
@@ -166,24 +169,119 @@ func FilterSearch(body map[string]any, tenant string) bool {
 	return true
 }
 
-// FilterTrace keeps a trace's resource spans whose service.name is the tenant; false when none are.
-func FilterTrace(body map[string]any, tenant string) bool {
+// FilterTrace keeps a trace's resource spans whose service.name is the tenant, and of the edge services' spans the
+// ones the tenant's sit under (Cloudflare's request, Traefik's router) and their own edge spans (Cloudflare's
+// firewall and response). Not an edge span under the tenant's (an ingress the tenant calls through to another app),
+// nor one of another request's. False when the tenant has no spans.
+func FilterTrace(body map[string]any, tenant string, edge map[string]bool) bool {
 	trace, ok := body["trace"].(map[string]any)
 	if !ok {
 		return false
 	}
 	resources, _ := trace["resourceSpans"].([]any)
-	var kept []any
+
+	type ref struct{ parent, service string }
+	spans := map[string]ref{}
+	children := map[string][]string{}
 	for _, rs := range resources {
-		if serviceName(rs) == tenant {
-			kept = append(kept, rs)
+		service := serviceName(rs)
+		for _, span := range spansOf(rs) {
+			id, _ := span["spanId"].(string)
+			parent, _ := span["parentSpanId"].(string)
+			if id != "" {
+				spans[id] = ref{parent, service}
+				children[parent] = append(children[parent], id)
+			}
 		}
 	}
-	if len(kept) == 0 {
+
+	// The edge spans above the tenant's, then their edge descendants
+	shown := map[string]bool{}
+	var queue []string
+	for _, r := range spans {
+		if r.service != tenant {
+			continue
+		}
+		for id := r.parent; id != "" && !shown[id] && edge[spans[id].service]; id = spans[id].parent {
+			shown[id] = true
+			queue = append(queue, id)
+		}
+	}
+	for len(queue) > 0 {
+		id := queue[0]
+		queue = queue[1:]
+		for _, child := range children[id] {
+			if !shown[child] && edge[spans[child].service] {
+				shown[child] = true
+				queue = append(queue, child)
+			}
+		}
+	}
+
+	var kept []any
+	hasTenant := false
+	for _, rs := range resources {
+		switch service := serviceName(rs); {
+		case service == tenant:
+			hasTenant = true
+			kept = append(kept, rs)
+		case edge[service]:
+			if keepSpans(rs, func(span map[string]any) bool {
+				id, _ := span["spanId"].(string)
+				return id != "" && shown[id]
+			}) {
+				kept = append(kept, rs)
+			}
+		}
+	}
+	if !hasTenant {
 		return false
 	}
 	trace["resourceSpans"] = kept
 	return true
+}
+
+// spansOf reads the spans of a resourceSpans entry.
+func spansOf(rs any) []map[string]any {
+	m, _ := rs.(map[string]any)
+	scopes, _ := m["scopeSpans"].([]any)
+	var out []map[string]any
+	for _, ss := range scopes {
+		scope, _ := ss.(map[string]any)
+		spans, _ := scope["spans"].([]any)
+		for _, s := range spans {
+			if span, ok := s.(map[string]any); ok {
+				out = append(out, span)
+			}
+		}
+	}
+	return out
+}
+
+// keepSpans drops the spans of a resourceSpans entry that keep answers false for, and the scopes left empty. True when
+// any span is left.
+func keepSpans(rs any, keep func(map[string]any) bool) bool {
+	m, _ := rs.(map[string]any)
+	scopes, _ := m["scopeSpans"].([]any)
+	var keptScopes []any
+	for _, ss := range scopes {
+		scope, _ := ss.(map[string]any)
+		spans, _ := scope["spans"].([]any)
+		var keptSpans []any
+		for _, s := range spans {
+			if span, ok := s.(map[string]any); ok && keep(span) {
+				keptSpans = append(keptSpans, span)
+			}
+		}
+		if len(keptSpans) > 0 {
+			scope["spans"] = keptSpans
+			keptScopes = append(keptScopes, scope)
+		}
+	}
+	if m != nil {
+		m["scopeSpans"] = keptScopes
+	}
+	return len(keptScopes) > 0
 }
 
 // serviceName reads resource.attributes[service.name].stringValue of a resourceSpans entry.

@@ -172,7 +172,7 @@ func TestFilterSearchHidesOtherServicesRoots(t *testing.T) {
 		{"traceID":"b","rootServiceName":"traefik","rootTraceName":"router secret","serviceStats":{"traefik":{"spanCount":1}}}
 	]}`), &body)
 
-	if !FilterSearch(body, "grif-test") {
+	if !FilterSearch(body, "grif-test", nil) {
 		t.Fatal("want kept")
 	}
 	out, _ := json.Marshal(body)
@@ -182,10 +182,10 @@ func TestFilterSearchHidesOtherServicesRoots(t *testing.T) {
 	if !strings.Contains(string(out), `"rootTraceName":"GET x"`) {
 		t.Errorf("the tenant's root removed: %s", out)
 	}
-	if !FilterSearch(map[string]any{}, "grif-test") {
+	if !FilterSearch(map[string]any{}, "grif-test", nil) {
 		t.Error("an empty answer is kept")
 	}
-	if FilterSearch(map[string]any{"traces": "nonsense"}, "grif-test") {
+	if FilterSearch(map[string]any{"traces": "nonsense"}, "grif-test", nil) {
 		t.Error("a malformed answer is refused")
 	}
 }
@@ -198,7 +198,7 @@ const traceJSON = `{"trace":{"resourceSpans":[
 func TestFilterTraceKeepsTheTenantsSpans(t *testing.T) {
 	var body map[string]any
 	json.Unmarshal([]byte(traceJSON), &body)
-	if !FilterTrace(body, "grif-test") {
+	if !FilterTrace(body, "grif-test", nil) {
 		t.Fatal("want kept")
 	}
 	out, _ := json.Marshal(body)
@@ -207,11 +207,83 @@ func TestFilterTraceKeepsTheTenantsSpans(t *testing.T) {
 	}
 
 	json.Unmarshal([]byte(traceJSON), &body)
-	if FilterTrace(body, "grif-prod") {
+	if FilterTrace(body, "grif-prod", nil) {
 		t.Error("a trace without the tenant's spans is refused")
 	}
-	if FilterTrace(map[string]any{}, "grif-test") {
+	if FilterTrace(map[string]any{}, "grif-test", nil) {
 		t.Error("no trace is refused")
+	}
+}
+
+// A request through Cloudflare and Traefik to grif-test, which calls another app through Traefik; and another request's
+// Traefik span in the same trace.
+const edgeTraceJSON = `{"trace":{"resourceSpans":[
+	{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"edge_processing"}}]},"scopeSpans":[{"spans":[
+		{"spanId":"cf1","name":"cloudflare_request"},
+		{"spanId":"cf2","parentSpanId":"cf1","name":"response"}]}]},
+	{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"origin_fetch"}}]},"scopeSpans":[{"spans":[
+		{"spanId":"of1","parentSpanId":"cf1","name":"origin"}]}]},
+	{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"traefik"}}]},"scopeSpans":[{"spans":[
+		{"spanId":"t1","parentSpanId":"of1","name":"router"},
+		{"spanId":"t1b","parentSpanId":"t1","name":"ReverseProxy"},
+		{"spanId":"t2","parentSpanId":"g2","name":"inner secret"},
+		{"spanId":"t3","name":"unrelated secret"}]}]},
+	{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"grif-test"}}]},"scopeSpans":[{"spans":[
+		{"spanId":"g1","parentSpanId":"t1b","name":"GET x"},
+		{"spanId":"g2","parentSpanId":"g1","name":"call"}]}]},
+	{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"other-app"}}]},"scopeSpans":[{"spans":[
+		{"spanId":"o1","parentSpanId":"t2","name":"other secret"}]}]}
+]}}`
+
+func TestFilterTraceKeepsTheEdgeSpansTheTenantsSitUnder(t *testing.T) {
+	edge := map[string]bool{"edge_processing": true, "origin_fetch": true, "traefik": true}
+	var body map[string]any
+	json.Unmarshal([]byte(edgeTraceJSON), &body)
+	if !FilterTrace(body, "grif-test", edge) {
+		t.Fatal("want kept")
+	}
+	out, _ := json.Marshal(body)
+	for _, name := range []string{"cloudflare_request", "response", "origin", "router", "ReverseProxy", "GET x", "call"} {
+		if !strings.Contains(string(out), `"`+name+`"`) {
+			t.Errorf("%s removed: %s", name, out)
+		}
+	}
+	if strings.Contains(string(out), "secret") {
+		t.Errorf("a span not leading to the tenant's left in: %s", out)
+	}
+
+	json.Unmarshal([]byte(edgeTraceJSON), &body)
+	if FilterTrace(body, "grif-prod", edge) {
+		t.Error("a trace with the edge's spans but not the tenant's is refused")
+	}
+	json.Unmarshal([]byte(edgeTraceJSON), &body)
+	FilterTrace(body, "grif-test", nil)
+	if out, _ := json.Marshal(body); strings.Contains(string(out), "router") {
+		t.Errorf("without edge services only the tenant's spans: %s", out)
+	}
+}
+
+func TestFilterSearchNamesTheEdgesRoots(t *testing.T) {
+	var body map[string]any
+	json.Unmarshal([]byte(`{"traces":[{"traceID":"a","rootServiceName":"edge_processing","rootTraceName":"cloudflare_request",
+		"serviceStats":{"grif-test":{"spanCount":1},"edge_processing":{"spanCount":4},"other-app":{"spanCount":1}}}]}`), &body)
+	FilterSearch(body, "grif-test", map[string]bool{"edge_processing": true})
+	out, _ := json.Marshal(body)
+	if !strings.Contains(string(out), `"rootTraceName":"cloudflare_request"`) || !strings.Contains(string(out), `"edge_processing":{"spanCount":4}`) {
+		t.Errorf("the edge's root or stats removed: %s", out)
+	}
+	if strings.Contains(string(out), "other-app") {
+		t.Errorf("another service's stats left in: %s", out)
+	}
+}
+
+func TestSetOf(t *testing.T) {
+	got := setOf(" traefik, edge_processing,,origin_fetch ")
+	if len(got) != 3 || !got["traefik"] || !got["edge_processing"] || !got["origin_fetch"] {
+		t.Errorf("got %v", got)
+	}
+	if len(setOf("")) != 0 {
+		t.Error("an empty list is no services")
 	}
 }
 

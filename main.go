@@ -20,6 +20,7 @@ import (
 	"os"
 	"os/signal"
 	"regexp"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -36,6 +37,7 @@ func main() {
 		podSelector   = flag.String("pod-selector", env("POD_SELECTOR", "app=grif-backend"), "label selector a caller's pod must match")
 		namespaces    = flag.String("namespaces", env("NAMESPACES", `^grif-(prod|staging|test|pr-[0-9]+)$`), "regexp a caller's namespace must match")
 		label         = flag.String("label", env("TENANT_LABEL", "service_name"), "the Prometheus and Loki label that carries the tenant")
+		edgeServices  = flag.String("edge-services", env("EDGE_SERVICES", ""), "comma-separated service.names in front of the tenants (ingress, CDN) whose spans a trace keeps where the tenant's sit under them")
 		apiServer     = flag.String("api-server", env("KUBERNETES_API", "https://kubernetes.default.svc"), "the Kubernetes API")
 	)
 	flag.Parse()
@@ -62,7 +64,7 @@ func main() {
 	sides := []side{
 		{*lokiAddr, *lokiURL, func(u *url.URL) http.Handler { return &Loki{Gate: g(u), Label: *label} }},
 		{*promAddr, *prometheusURL, func(u *url.URL) http.Handler { return &Prometheus{Gate: g(u), Label: *label} }},
-		{*tempoAddr, *tempoURL, func(u *url.URL) http.Handler { return &Tempo{Gate: g(u)} }},
+		{*tempoAddr, *tempoURL, func(u *url.URL) http.Handler { return &Tempo{Gate: g(u), Edge: setOf(*edgeServices)} }},
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -106,4 +108,15 @@ func env(name, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// setOf reads a comma-separated list, blanks dropped.
+func setOf(list string) map[string]bool {
+	set := map[string]bool{}
+	for _, item := range strings.Split(list, ",") {
+		if item = strings.TrimSpace(item); item != "" {
+			set[item] = true
+		}
+	}
+	return set
 }
