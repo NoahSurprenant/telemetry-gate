@@ -355,14 +355,15 @@ func TestFilterTraceKeepsOnlyTheEdgeSpansOfTheTenantsOwnRequests(t *testing.T) {
 		t.Fatal("want kept")
 	}
 	out, _ := json.Marshal(body)
-	// The Cloudflare request fetched from two origins: its root and response are prod's request's too
-	for _, name := range []string{"origin", "router", "GET x", "browser click", "called by prod"} {
+	// The Cloudflare request fetched from two origins: it is prod's request's too, so its chain (whose top it is)
+	// shows nothing, not even grif-test's own origin fetch and router under it
+	for _, name := range []string{"GET x", "browser click", "called by prod"} {
 		if !strings.Contains(string(out), `"`+name+`"`) {
 			t.Errorf("%s removed: %s", name, out)
 		}
 	}
-	if strings.Contains(string(out), "secret") {
-		t.Errorf("another request's edge span left in: %s", out)
+	if strings.Contains(string(out), "secret") || strings.Contains(string(out), `"router"`) || strings.Contains(string(out), `"origin"`) {
+		t.Errorf("an edge span of a chain whose top is another request's left in: %s", out)
 	}
 }
 
@@ -401,8 +402,8 @@ func TestFilterTraceTreatsACallWhoseCalleeIsMissingAsAnotherApps(t *testing.T) {
 	if strings.Contains(string(out), "secret") {
 		t.Errorf("a span of a request to an app not in the trace left in: %s", out)
 	}
-	if !strings.Contains(string(out), `"router"`) || !strings.Contains(string(out), `"origin"`) {
-		t.Errorf("the tenant's own edge spans removed: %s", out)
+	if strings.Contains(string(out), `"router"`) || strings.Contains(string(out), `"origin"`) {
+		t.Errorf("an edge span of a chain whose top leads elsewhere left in: %s", out)
 	}
 }
 
@@ -470,6 +471,8 @@ func TestFilterTraceShowsAnEdgeChainOnlyWithTheTenantsHost(t *testing.T) {
 		{"no hosts known (the lookup failed)", edgeChain(3, "grif-test.example"), nil, false},
 		{"32 spans", edgeChain(32, "grif-test.example"), testHosts, true},
 		{"33 spans", edgeChain(33, "grif-test.example"), testHosts, false},
+		{"a port", edgeChain(3, "grif-test.example:443"), testHosts, true},
+		{"a trailing dot, upper case", edgeChain(3, "GRIF-test.example."), testHosts, true},
 	}
 	for _, c := range cases {
 		if FilterTrace(c.body, "grif-test", traefik, c.hosts); shown(c.body) != c.want {
@@ -480,7 +483,7 @@ func TestFilterTraceShowsAnEdgeChainOnlyWithTheTenantsHost(t *testing.T) {
 
 func TestFilterTraceStopsAChainAtAnotherHost(t *testing.T) {
 	// grif-test's own Traefik router, under the Cloudflare request of another host (another app's request that reached
-	// grif-test): the router is shown, the other host's request not
+	// grif-test): the chain's top is another host's, so none of it is shown
 	var body map[string]any
 	json.Unmarshal([]byte(`{"trace":{"resourceSpans":[
 		{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"edge_processing"}}]},"scopeSpans":[{"spans":[
@@ -491,42 +494,110 @@ func TestFilterTraceStopsAChainAtAnotherHost(t *testing.T) {
 			{"spanId":"g","parentSpanId":"t","name":"mine"}]}]}]}}`), &body)
 	FilterTrace(body, "grif-test", Related{Edge: map[string]bool{"edge_processing": true, "traefik": true}}, testHosts)
 	out, _ := json.Marshal(body)
-	if strings.Contains(string(out), "secret") || !strings.Contains(string(out), `"router"`) {
+	if strings.Contains(string(out), "secret") || strings.Contains(string(out), `"router"`) {
+		t.Errorf("got %s", out)
+	}
+}
+
+// A tenant's forged Traefik span naming its own host, under another request's host-less Cloudflare span: the chain's
+// top (that request's root) names another host, so nothing is shown.
+func TestFilterTraceTakesNoEvidenceFromBelowTheChainsTop(t *testing.T) {
+	var body map[string]any
+	json.Unmarshal([]byte(`{"trace":{"resourceSpans":[
+		{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"edge_processing"}}]},"scopeSpans":[{"spans":[
+			{"spanId":"cf","name":"victim request secret","attributes":[{"key":"server.address","value":{"stringValue":"prod.example"}}]},
+			{"spanId":"fw","parentSpanId":"cf","name":"victim firewall secret"}]}]},
+		{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"traefik"}}]},"scopeSpans":[{"spans":[
+			{"spanId":"fake","parentSpanId":"fw","name":"forged secret","attributes":[{"key":"server.address","value":{"stringValue":"grif-test.example"}}]}]}]},
+		{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"grif-test"}}]},"scopeSpans":[{"spans":[
+			{"spanId":"g","parentSpanId":"fake","name":"mine"}]}]}]}}`), &body)
+	FilterTrace(body, "grif-test", Related{Edge: map[string]bool{"edge_processing": true, "traefik": true}}, testHosts)
+	if out, _ := json.Marshal(body); strings.Contains(string(out), "secret") {
+		t.Errorf("got %s", out)
+	}
+}
+
+// The chain's top sits under a span not in the trace (a caller sampled out, not ingested, or a forged id): not shown.
+func TestFilterTraceShowsNoChainUnderAMissingSpan(t *testing.T) {
+	var body map[string]any
+	json.Unmarshal([]byte(`{"trace":{"resourceSpans":[
+		{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"traefik"}}]},"scopeSpans":[{"spans":[
+			{"spanId":"t","parentSpanId":"missing","name":"router","attributes":[{"key":"server.address","value":{"stringValue":"grif-test.example"}}]}]}]},
+		{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"grif-test"}}]},"scopeSpans":[{"spans":[
+			{"spanId":"g","parentSpanId":"t","name":"mine"}]}]}]}}`), &body)
+	FilterTrace(body, "grif-test", Related{Edge: map[string]bool{"traefik": true}}, testHosts)
+	if out, _ := json.Marshal(body); strings.Contains(string(out), "router") {
 		t.Errorf("got %s", out)
 	}
 }
 
 func TestIngressRouteHosts(t *testing.T) {
 	calls := 0
+	failing := false
 	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls++
-		if r.Header.Get("Authorization") != "Bearer token" {
-			w.WriteHeader(401)
+		if r.Header.Get("Authorization") != "Bearer token" || r.URL.Path != "/apis/traefik.io/v1alpha1/ingressroutes" || failing {
+			w.WriteHeader(500)
 			return
 		}
-		switch r.URL.Path {
-		case "/apis/traefik.io/v1alpha1/namespaces/grif-test/ingressroutes":
-			io.WriteString(w, strings.ReplaceAll(`{"items":[{"spec":{"routes":[
+		io.WriteString(w, strings.ReplaceAll(`{"items":[
+			{"metadata":{"namespace":"grif-test"},"spec":{"routes":[
 				{"match":"Host(´grif-test.example´)"},
 				{"match":"Host(´grif-test.example´) && PathRegexp(´^/hub/´)"},
-				{"match":"(Host(´a.example´) || Host(´b.example´)) && PathPrefix(´/x´)"}]}}]}`, "´", "`"))
-		default:
-			w.WriteHeader(500)
-		}
+				{"match":"(Host(´a.example´) || Host(\"b.example\")) && PathPrefix(´/x´)"},
+				{"match":"Host(´m1.example´, ´m2.example´)"},
+				{"match":"Host( ´s.example´ )"},
+				{"match":"!Host(´grif.prod´)"},
+				{"match":"Header(\"X-Note\", \"Host(´fake.example´)\")"},
+				{"match":"Host(´shared.example´)"}]}},
+			{"metadata":{"namespace":"grif-prod"},"spec":{"routes":[
+				{"match":"Host(´grif.prod´) || Host(´shared.example´)"}]}}]}`, "´", "`"))
 	}))
 	defer api.Close()
 	h := newIngressRouteHosts(api.URL, api.Client(), func() (string, error) { return "token", nil })
 
 	got, err := h.Hosts(context.Background(), "grif-test")
-	if err != nil || len(got) != 3 || !got["grif-test.example"] || !got["a.example"] || !got["b.example"] {
+	want := []string{"grif-test.example", "a.example", "b.example", "m1.example", "m2.example", "s.example"}
+	if err != nil || len(got) != len(want) {
 		t.Errorf("got %v %v", got, err)
 	}
-	h.Hosts(context.Background(), "grif-test")
-	if calls != 1 {
-		t.Errorf("not cached: %d calls", calls)
+	for _, host := range want {
+		if !got[host] {
+			t.Errorf("%s missing from %v", host, got)
+		}
 	}
-	if got, err := h.Hosts(context.Background(), "grif-prod"); err == nil || got != nil {
+	if prod, _ := h.Hosts(context.Background(), "grif-prod"); len(prod) != 1 || !prod["grif.prod"] {
+		t.Errorf("prod: %v (a host two namespaces claim is neither's)", prod)
+	}
+	if calls != 1 {
+		t.Errorf("one cluster-wide read, cached: %d calls", calls)
+	}
+
+	failing = true
+	broken := newIngressRouteHosts(api.URL, api.Client(), func() (string, error) { return "token", nil })
+	before := calls
+	if got, err := broken.Hosts(context.Background(), "grif-test"); err == nil || got != nil {
 		t.Errorf("API failing: want an error and no hosts, got %v %v", got, err)
+	}
+	broken.Hosts(context.Background(), "grif-test")
+	if calls != before+1 {
+		t.Errorf("a failed read is kept briefly: %d calls", calls-before)
+	}
+}
+
+type countingHosts struct{ calls int }
+
+func (c *countingHosts) Hosts(context.Context, string) (map[string]bool, error) {
+	c.calls++
+	return testHosts, nil
+}
+
+func TestTempoTraceReadsNoHostsWithoutEdgeSpans(t *testing.T) {
+	u, _ := upstream(t, 200, traceJSON)
+	hosts := &countingHosts{}
+	h := &Tempo{Gate: gate(u, tenants), Related: Related{Edge: map[string]bool{"edge_processing": true}}, Hosts: hosts}
+	if rec := call(h, "GET", "/api/v2/traces/0123abc", "10.0.1.5", nil); rec.Code != 200 || hosts.calls != 0 {
+		t.Errorf("got %d, %d host reads", rec.Code, hosts.calls)
 	}
 }
 
