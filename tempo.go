@@ -10,12 +10,21 @@ import (
 )
 
 // Tempo allows a TraceQL search, narrowed to the tenant's spans, and fetching a trace by id, cut down to the tenant's
-// spans and the edge spans that lead to them. The tenant is resource.service.name.
+// spans and the related services' spans of the tenant's requests (Related). The tenant is resource.service.name.
 type Tempo struct {
 	Gate
-	// Edge holds the service.names in front of the tenants (the ingress, the CDN): a trace keeps their spans that its
-	// tenant's spans sit under, and those spans' own edge spans (FilterTrace), and a search names their roots.
+	Related
+}
+
+// Related names the services whose spans a tenant's trace keeps where they belong to the tenant's requests
+// (FilterTrace).
+type Related struct {
+	// Edge: the services in front of the tenants (the ingress, the CDN). A trace keeps their spans the tenant's sit
+	// under, and those spans' own edge spans; a search names their roots.
 	Edge map[string]bool
+	// Downstream: the services the tenants call (a gateway to another API). A trace keeps their spans under the
+	// tenant's.
+	Downstream map[string]bool
 }
 
 const tracePath = "/api/v2/traces/"
@@ -49,7 +58,7 @@ func (t *Tempo) search(w http.ResponseWriter, r *http.Request) {
 	}
 	kept := only(values, "start", "end", "limit", "spss", "minDuration", "maxDuration")
 	kept.Set("q", q)
-	t.filter(w, r, tenant, r.URL.Path, kept, func(body map[string]any) bool { return FilterSearch(body, tenant, t.Edge) })
+	t.filter(w, r, tenant, r.URL.Path, kept, func(body map[string]any) bool { return FilterSearch(body, tenant, t.Related) })
 }
 
 func (t *Tempo) trace(w http.ResponseWriter, r *http.Request) {
@@ -61,7 +70,7 @@ func (t *Tempo) trace(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	t.filter(w, r, tenant, r.URL.Path, only(r.URL.Query(), "start", "end"), func(body map[string]any) bool { return FilterTrace(body, tenant, t.Edge) })
+	t.filter(w, r, tenant, r.URL.Path, only(r.URL.Query(), "start", "end"), func(body map[string]any) bool { return FilterTrace(body, tenant, t.Related) })
 }
 
 // filter reads the upstream's JSON answer and sends it on after keep; keep false is a 404.
@@ -142,8 +151,9 @@ func EnforceTraceQL(query, tenant string) (string, error) {
 
 // FilterSearch keeps what a search may say about other services: a trace's root is named only when it is the
 // tenant's or an edge service's (every trace found has the tenant's spans), and the per-service counts keep the
-// tenant's and the edge's. The matched spans are the tenant's already. False when the answer isn't a search's.
-func FilterSearch(body map[string]any, tenant string, edge map[string]bool) bool {
+// tenant's and the related services'. The matched spans are the tenant's already. False when the answer isn't a
+// search's.
+func FilterSearch(body map[string]any, tenant string, related Related) bool {
 	traces, ok := body["traces"].([]any)
 	if !ok {
 		_, has := body["traces"]
@@ -154,13 +164,13 @@ func FilterSearch(body map[string]any, tenant string, edge map[string]bool) bool
 		if !ok {
 			continue
 		}
-		if root, _ := trace["rootServiceName"].(string); root != tenant && !edge[root] {
+		if root, _ := trace["rootServiceName"].(string); root != tenant && !related.Edge[root] {
 			delete(trace, "rootServiceName")
 			delete(trace, "rootTraceName")
 		}
 		if stats, ok := trace["serviceStats"].(map[string]any); ok {
 			for service := range stats {
-				if service != tenant && !edge[service] {
+				if service != tenant && !related.Edge[service] && !related.Downstream[service] {
 					delete(stats, service)
 				}
 			}
@@ -169,11 +179,13 @@ func FilterSearch(body map[string]any, tenant string, edge map[string]bool) bool
 	return true
 }
 
-// FilterTrace keeps a trace's resource spans whose service.name is the tenant, and of the edge services' spans the
-// ones the tenant's sit under (Cloudflare's request, Traefik's router) and their own edge spans (Cloudflare's
-// firewall and response). Not an edge span under the tenant's (an ingress the tenant calls through to another app),
-// nor one of another request's. False when the tenant has no spans.
-func FilterTrace(body map[string]any, tenant string, edge map[string]bool) bool {
+// FilterTrace keeps a trace's resource spans whose service.name is the tenant; of the edge services' spans the ones
+// the tenant's sit under (Cloudflare's request, Traefik's router) and their own edge spans (Cloudflare's firewall and
+// response); and of the downstream services' spans the ones under the tenant's (the Halo gateway's), through
+// downstream spans only. Not an edge span under the tenant's (an ingress the tenant calls through to another app), nor
+// one of another request's. False when the tenant has no spans.
+func FilterTrace(body map[string]any, tenant string, related Related) bool {
+	edge, downstream := related.Edge, related.Downstream
 	trace, ok := body["trace"].(map[string]any)
 	if !ok {
 		return false
@@ -218,6 +230,23 @@ func FilterTrace(body map[string]any, tenant string, edge map[string]bool) bool 
 		}
 	}
 
+	// The downstream spans under the tenant's, and theirs
+	for id, r := range spans {
+		if r.service == tenant {
+			queue = append(queue, id)
+		}
+	}
+	for len(queue) > 0 {
+		id := queue[0]
+		queue = queue[1:]
+		for _, child := range children[id] {
+			if !shown[child] && downstream[spans[child].service] {
+				shown[child] = true
+				queue = append(queue, child)
+			}
+		}
+	}
+
 	var kept []any
 	hasTenant := false
 	for _, rs := range resources {
@@ -225,7 +254,7 @@ func FilterTrace(body map[string]any, tenant string, edge map[string]bool) bool 
 		case service == tenant:
 			hasTenant = true
 			kept = append(kept, rs)
-		case edge[service]:
+		case edge[service] || downstream[service]:
 			if keepSpans(rs, func(span map[string]any) bool {
 				id, _ := span["spanId"].(string)
 				return id != "" && shown[id]

@@ -172,7 +172,7 @@ func TestFilterSearchHidesOtherServicesRoots(t *testing.T) {
 		{"traceID":"b","rootServiceName":"traefik","rootTraceName":"router secret","serviceStats":{"traefik":{"spanCount":1}}}
 	]}`), &body)
 
-	if !FilterSearch(body, "grif-test", nil) {
+	if !FilterSearch(body, "grif-test", Related{}) {
 		t.Fatal("want kept")
 	}
 	out, _ := json.Marshal(body)
@@ -182,10 +182,10 @@ func TestFilterSearchHidesOtherServicesRoots(t *testing.T) {
 	if !strings.Contains(string(out), `"rootTraceName":"GET x"`) {
 		t.Errorf("the tenant's root removed: %s", out)
 	}
-	if !FilterSearch(map[string]any{}, "grif-test", nil) {
+	if !FilterSearch(map[string]any{}, "grif-test", Related{}) {
 		t.Error("an empty answer is kept")
 	}
-	if FilterSearch(map[string]any{"traces": "nonsense"}, "grif-test", nil) {
+	if FilterSearch(map[string]any{"traces": "nonsense"}, "grif-test", Related{}) {
 		t.Error("a malformed answer is refused")
 	}
 }
@@ -198,7 +198,7 @@ const traceJSON = `{"trace":{"resourceSpans":[
 func TestFilterTraceKeepsTheTenantsSpans(t *testing.T) {
 	var body map[string]any
 	json.Unmarshal([]byte(traceJSON), &body)
-	if !FilterTrace(body, "grif-test", nil) {
+	if !FilterTrace(body, "grif-test", Related{}) {
 		t.Fatal("want kept")
 	}
 	out, _ := json.Marshal(body)
@@ -207,10 +207,10 @@ func TestFilterTraceKeepsTheTenantsSpans(t *testing.T) {
 	}
 
 	json.Unmarshal([]byte(traceJSON), &body)
-	if FilterTrace(body, "grif-prod", nil) {
+	if FilterTrace(body, "grif-prod", Related{}) {
 		t.Error("a trace without the tenant's spans is refused")
 	}
-	if FilterTrace(map[string]any{}, "grif-test", nil) {
+	if FilterTrace(map[string]any{}, "grif-test", Related{}) {
 		t.Error("no trace is refused")
 	}
 }
@@ -239,7 +239,7 @@ func TestFilterTraceKeepsTheEdgeSpansTheTenantsSitUnder(t *testing.T) {
 	edge := map[string]bool{"edge_processing": true, "origin_fetch": true, "traefik": true}
 	var body map[string]any
 	json.Unmarshal([]byte(edgeTraceJSON), &body)
-	if !FilterTrace(body, "grif-test", edge) {
+	if !FilterTrace(body, "grif-test", Related{Edge: edge}) {
 		t.Fatal("want kept")
 	}
 	out, _ := json.Marshal(body)
@@ -253,13 +253,57 @@ func TestFilterTraceKeepsTheEdgeSpansTheTenantsSitUnder(t *testing.T) {
 	}
 
 	json.Unmarshal([]byte(edgeTraceJSON), &body)
-	if FilterTrace(body, "grif-prod", edge) {
+	if FilterTrace(body, "grif-prod", Related{Edge: edge}) {
 		t.Error("a trace with the edge's spans but not the tenant's is refused")
 	}
 	json.Unmarshal([]byte(edgeTraceJSON), &body)
-	FilterTrace(body, "grif-test", nil)
+	FilterTrace(body, "grif-test", Related{})
 	if out, _ := json.Marshal(body); strings.Contains(string(out), "router") {
 		t.Errorf("without edge services only the tenant's spans: %s", out)
+	}
+}
+
+// grif-test calls the Halo gateway, which another tenant's request uses too in the same trace (as if joined).
+const downstreamTraceJSON = `{"trace":{"resourceSpans":[
+	{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"grif-test"}}]},"scopeSpans":[{"spans":[
+		{"spanId":"g1","name":"GET x"},
+		{"spanId":"g2","parentSpanId":"g1","name":"GET halo-gateway"}]}]},
+	{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"halo-gateway"}}]},"scopeSpans":[{"spans":[
+		{"spanId":"h1","parentSpanId":"g2","name":"GET /stats"},
+		{"spanId":"h2","parentSpanId":"h1","name":"GET halo api"},
+		{"spanId":"h3","parentSpanId":"p1","name":"prod secret"},
+		{"spanId":"h4","name":"loose secret"}]}]},
+	{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"grif-prod"}}]},"scopeSpans":[{"spans":[
+		{"spanId":"p1","name":"prod secret request"}]}]}
+]}}`
+
+func TestFilterTraceKeepsTheDownstreamSpansUnderTheTenants(t *testing.T) {
+	related := Related{Downstream: map[string]bool{"halo-gateway": true}}
+	var body map[string]any
+	json.Unmarshal([]byte(downstreamTraceJSON), &body)
+	if !FilterTrace(body, "grif-test", related) {
+		t.Fatal("want kept")
+	}
+	out, _ := json.Marshal(body)
+	for _, name := range []string{"GET x", "GET halo-gateway", "GET /stats", "GET halo api"} {
+		if !strings.Contains(string(out), `"`+name+`"`) {
+			t.Errorf("%s removed: %s", name, out)
+		}
+	}
+	if strings.Contains(string(out), "secret") {
+		t.Errorf("a span not under the tenant's left in: %s", out)
+	}
+
+	// An edge-only setting keeps no downstream span, and a downstream one no edge span above the tenant's
+	json.Unmarshal([]byte(downstreamTraceJSON), &body)
+	FilterTrace(body, "grif-test", Related{Edge: map[string]bool{"halo-gateway": true}})
+	if out, _ := json.Marshal(body); strings.Contains(string(out), "GET /stats") {
+		t.Errorf("an edge service's span under the tenant's kept: %s", out)
+	}
+	json.Unmarshal([]byte(edgeTraceJSON), &body)
+	FilterTrace(body, "grif-test", Related{Downstream: map[string]bool{"traefik": true}})
+	if out, _ := json.Marshal(body); strings.Contains(string(out), "router") || !strings.Contains(string(out), "inner secret") {
+		t.Errorf("a downstream service kept above the tenant's, or not under it: %s", out)
 	}
 }
 
@@ -267,13 +311,21 @@ func TestFilterSearchNamesTheEdgesRoots(t *testing.T) {
 	var body map[string]any
 	json.Unmarshal([]byte(`{"traces":[{"traceID":"a","rootServiceName":"edge_processing","rootTraceName":"cloudflare_request",
 		"serviceStats":{"grif-test":{"spanCount":1},"edge_processing":{"spanCount":4},"other-app":{"spanCount":1}}}]}`), &body)
-	FilterSearch(body, "grif-test", map[string]bool{"edge_processing": true})
+	FilterSearch(body, "grif-test", Related{Edge: map[string]bool{"edge_processing": true}})
 	out, _ := json.Marshal(body)
 	if !strings.Contains(string(out), `"rootTraceName":"cloudflare_request"`) || !strings.Contains(string(out), `"edge_processing":{"spanCount":4}`) {
 		t.Errorf("the edge's root or stats removed: %s", out)
 	}
 	if strings.Contains(string(out), "other-app") {
 		t.Errorf("another service's stats left in: %s", out)
+	}
+
+	json.Unmarshal([]byte(`{"traces":[{"traceID":"a","rootServiceName":"halo-gateway","rootTraceName":"x",
+		"serviceStats":{"grif-test":{"spanCount":1},"halo-gateway":{"spanCount":2}}}]}`), &body)
+	FilterSearch(body, "grif-test", Related{Downstream: map[string]bool{"halo-gateway": true}})
+	out, _ = json.Marshal(body)
+	if strings.Contains(string(out), "rootServiceName") || !strings.Contains(string(out), `"halo-gateway":{"spanCount":2}`) {
+		t.Errorf("a downstream root named, or its stats removed: %s", out)
 	}
 }
 
