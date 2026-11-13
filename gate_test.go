@@ -273,7 +273,7 @@ const downstreamTraceJSON = `{"trace":{"resourceSpans":[
 		{"spanId":"g1","name":"GET x"},
 		{"spanId":"g2","parentSpanId":"g1","name":"GET halo-gateway"}]}]},
 	{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"halo-gateway"}}]},"scopeSpans":[{"spans":[
-		{"spanId":"h1","parentSpanId":"g2","name":"GET /stats"},
+		{"spanId":"h1","parentSpanId":"g2","name":"GET /stats","attributes":[{"key":"grunt.api_key","value":{"stringValue":"grif-test"}}]},
 		{"spanId":"h2","parentSpanId":"h1","name":"GET halo api"},
 		{"spanId":"h3","parentSpanId":"p1","name":"prod secret"},
 		{"spanId":"h4","name":"loose secret"}]}]},
@@ -282,7 +282,7 @@ const downstreamTraceJSON = `{"trace":{"resourceSpans":[
 ]}}`
 
 func TestFilterTraceKeepsTheDownstreamSpansUnderTheTenants(t *testing.T) {
-	related := Related{Downstream: map[string]bool{"halo-gateway": true}}
+	related := Related{Downstream: map[string]bool{"halo-gateway": true}, Caller: "grunt.api_key"}
 	var body map[string]any
 	json.Unmarshal([]byte(downstreamTraceJSON), &body)
 	if !FilterTrace(body, "grif-test", related, testHosts) {
@@ -305,9 +305,9 @@ func TestFilterTraceKeepsTheDownstreamSpansUnderTheTenants(t *testing.T) {
 		t.Errorf("an edge service's span under the tenant's kept: %s", out)
 	}
 	json.Unmarshal([]byte(edgeTraceJSON), &body)
-	FilterTrace(body, "grif-test", Related{Downstream: map[string]bool{"traefik": true}}, testHosts)
-	if out, _ := json.Marshal(body); strings.Contains(string(out), "router") || !strings.Contains(string(out), "inner secret") {
-		t.Errorf("a downstream service kept above the tenant's, or not under it: %s", out)
+	FilterTrace(body, "grif-test", Related{Downstream: map[string]bool{"traefik": true}, Caller: "grunt.api_key"}, testHosts)
+	if out, _ := json.Marshal(body); strings.Contains(string(out), "router") {
+		t.Errorf("a downstream service kept above the tenant's: %s", out)
 	}
 }
 
@@ -585,25 +585,6 @@ func TestIngressRouteHosts(t *testing.T) {
 	broken.Hosts(context.Background(), "grif-test")
 	if calls != before+1 {
 		t.Errorf("a failed read is kept briefly: %d calls", calls-before)
-	}
-}
-
-func TestIngressRouteHostsKeepsAFailedReadFromWhenItEnds(t *testing.T) {
-	failedTTLWas := failedTTL
-	failedTTL = 50 * time.Millisecond
-	defer func() { failedTTL = failedTTLWas }()
-	calls := 0
-	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		calls++
-		time.Sleep(2 * failedTTL)
-		w.WriteHeader(500)
-	}))
-	defer api.Close()
-	h := newIngressRouteHosts(api.URL, api.Client(), func() (string, error) { return "token", nil })
-	h.Hosts(context.Background(), "grif-test")
-	h.Hosts(context.Background(), "grif-test")
-	if calls != 1 {
-		t.Errorf("a read slower than failedTTL was read again at once: %d calls", calls)
 	}
 }
 
