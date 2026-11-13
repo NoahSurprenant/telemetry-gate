@@ -83,7 +83,7 @@ func (t *Tempo) trace(w http.ResponseWriter, r *http.Request) {
 // tenantHosts reads the tenant's hosts when the trace has edge spans to show; nil (so none shown) when they can't
 // be read.
 func (t *Tempo) tenantHosts(ctx context.Context, tenant string, body map[string]any) map[string]bool {
-	if len(t.Edge) == 0 || t.Hosts == nil || !hasService(body, t.Edge) {
+	if len(t.Edge) == 0 || t.Hosts == nil || !hasService(body, t.Edge) || !hasService(body, map[string]bool{tenant: true}) {
 		return nil
 	}
 	hosts, err := t.Hosts.Hosts(ctx, tenant)
@@ -297,10 +297,18 @@ func FilterTrace(body map[string]any, tenant string, related Related, hosts map[
 		return related.Edge[g.service(child)] && (host == "" || hosts[host]) && !elsewhere(child)
 	})
 
-	// Downstream: under the tenant's spans
+	// Downstream: under the tenant's spans; not one a server span of the tenant's sits under, which is how a caller's
+	// span looks (the tenant's server span's parent): a tenant could copy that id, which it is sent, to sit over the
+	// caller's own downstream calls
+	called := map[string]bool{}
+	for _, id := range g.of(tenant) {
+		if g.spans[id].kind == serverKind {
+			called[g.spans[id].parent] = true
+		}
+	}
 	var downQueue []string
 	for _, id := range g.of(tenant) {
-		if !g.shared[id] {
+		if !g.shared[id] && !called[id] {
 			downQueue = append(downQueue, id)
 		}
 	}
@@ -366,16 +374,27 @@ func (g spanGraph) leadsElsewhere(tenant string, edge, hosts map[string]bool) fu
 		}
 		return result, capped
 	}
+	// From the top (depth 0) an answer is final: kept, so a chain many of the tenant's spans share is looked at once
+	answered := map[string]bool{}
 	return func(id string) bool {
+		if v, done := answered[id]; done {
+			return v
+		}
 		result, _ := below(id, 0)
+		answered[id] = result
 		return result
 	}
 }
 
-const clientKind = "SPAN_KIND_CLIENT"
+const (
+	clientKind = "SPAN_KIND_CLIENT"
+	serverKind = "SPAN_KIND_SERVER"
+)
 
-// hostOf reads a span's server.address when it is a host name, lower case; "" for none or an IP address.
-func hostOf(span map[string]any) string {
+// hostOf reads a span's server.address as a host: lower case, without a port or a trailing dot; "" for none, or an
+// address on a client call (Traefik's proxying to a pod, whose callee's own spans say whose it is). An address on
+// any other span is another origin's, named so it matches no tenant's host.
+func hostOf(span map[string]any, kind string) string {
 	attrs, _ := span["attributes"].([]any)
 	for _, a := range attrs {
 		attr, _ := a.(map[string]any)
@@ -385,8 +404,11 @@ func hostOf(span map[string]any) string {
 		value, _ := attr["value"].(map[string]any)
 		host, _ := value["stringValue"].(string)
 		host = normalHost(host)
-		if host == "" || net.ParseIP(host) != nil {
-			return ""
+		if net.ParseIP(host) != nil {
+			if kind == clientKind {
+				return ""
+			}
+			return "address:" + host
 		}
 		return host
 	}
@@ -420,7 +442,7 @@ func indexSpans(resources []any) spanGraph {
 			if _, seen := g.spans[id]; seen {
 				g.shared[id] = true
 			}
-			g.spans[id] = spanRef{parent, service, kind, hostOf(span)}
+			g.spans[id] = spanRef{parent, service, kind, hostOf(span, kind)}
 			g.children[parent] = append(g.children[parent], id)
 			g.byService[service] = append(g.byService[service], id)
 		}

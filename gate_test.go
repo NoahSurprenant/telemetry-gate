@@ -675,6 +675,22 @@ func TestTempoTraceReadsNoHostsWithoutTheTenantsSpans(t *testing.T) {
 	}
 }
 
+// grif-prod calls grif-test, sending its client span's id p9; grif-test copies p9 as a span of its own, under which
+// prod's own call to the Halo gateway would sit. The gateway's spans there aren't grif-test's.
+func TestFilterTraceKeepsNoDownstreamSpanUnderACallersCopiedSpan(t *testing.T) {
+	var body map[string]any
+	json.Unmarshal([]byte(`{"trace":{"resourceSpans":[
+		{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"grif-test"}}]},"scopeSpans":[{"spans":[
+			{"spanId":"p9","name":"copied","kind":"SPAN_KIND_CLIENT"},
+			{"spanId":"g","parentSpanId":"p9","name":"mine","kind":"SPAN_KIND_SERVER"}]}]},
+		{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"halo-gateway"}}]},"scopeSpans":[{"spans":[
+			{"spanId":"h","parentSpanId":"p9","name":"prod gateway secret"}]}]}]}}`), &body)
+	FilterTrace(body, "grif-test", Related{Downstream: map[string]bool{"halo-gateway": true}}, testHosts)
+	if out, _ := json.Marshal(body); strings.Contains(string(out), "secret") {
+		t.Errorf("got %s", out)
+	}
+}
+
 type countingHosts struct{ calls int }
 
 func (c *countingHosts) Hosts(context.Context, string) (map[string]bool, error) {

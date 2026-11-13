@@ -35,15 +35,19 @@ under, only when:
 
 Then their edge descendants that lead to no other app and name no other host (Cloudflare's firewall and response).
 
-A tenant's hosts are the `Host(...)` rules (not `!Host`, nor text inside another matcher's argument) of the Traefik
-IngressRoutes in its namespace, read cluster-wide from the Kubernetes API (kept 15s, a failed read 5s). A host more
-than one namespace claims is no one's. When they can't be read, or the trace has no edge span, nothing is read and no
-edge span kept. Needs `get` and `list` on `ingressroutes.traefik.io`, cluster-wide. Startup refuses a service in both
+A tenant's hosts are the `Host(...)` matchers' quoted arguments of the Traefik IngressRoutes in its namespace
+(outside quoted text; a rule with a `!` anywhere outside it claims nothing), read cluster-wide from the Kubernetes
+API on a context of the gate's own (kept 15s, a failed read 5s from when it ends, one read at a time). A host more
+than one namespace claims is no one's (so a namespace can hide another's edge spans by claiming its host, never show
+its own). An IP address in `server.address` is no host: on a client call (Traefik's proxying) it is ignored, on any
+other edge span it is another origin's. When the hosts can't be read, or the trace has no edge span or none of the
+tenant's, nothing is read and no edge span kept. Needs `get` and `list` on `ingressroutes.traefik.io`, cluster-wide. Startup refuses a service in both
 lists or named like a tenant.
 
 **Downstream services** (`DOWNSTREAM_SERVICES`, comma-separated, ex. `halo-gateway`): services the tenants call. A
 trace fetched by id also keeps their spans under the tenant's, through downstream spans only (a gateway reached
-through the ingress is not kept).
+through the ingress is not kept), not under a tenant span one of its own server spans sits under (a caller's span
+id, which the tenant is sent and could copy).
 
 Spans come from every service in a trace, a tenant's included, so a span id two spans share links nothing: one
 could otherwise reuse another's id to sit under or over its spans. With neither setting, a trace keeps only the
