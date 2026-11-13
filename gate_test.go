@@ -199,7 +199,7 @@ const traceJSON = `{"trace":{"resourceSpans":[
 func TestFilterTraceKeepsTheTenantsSpans(t *testing.T) {
 	var body map[string]any
 	json.Unmarshal([]byte(traceJSON), &body)
-	if !FilterTrace(body, "grif-test", Related{}) {
+	if !FilterTrace(body, "grif-test", Related{}, testHosts) {
 		t.Fatal("want kept")
 	}
 	out, _ := json.Marshal(body)
@@ -208,10 +208,10 @@ func TestFilterTraceKeepsTheTenantsSpans(t *testing.T) {
 	}
 
 	json.Unmarshal([]byte(traceJSON), &body)
-	if FilterTrace(body, "grif-prod", Related{}) {
+	if FilterTrace(body, "grif-prod", Related{}, testHosts) {
 		t.Error("a trace without the tenant's spans is refused")
 	}
-	if FilterTrace(map[string]any{}, "grif-test", Related{}) {
+	if FilterTrace(map[string]any{}, "grif-test", Related{}, testHosts) {
 		t.Error("no trace is refused")
 	}
 }
@@ -220,12 +220,12 @@ func TestFilterTraceKeepsTheTenantsSpans(t *testing.T) {
 // Traefik span in the same trace.
 const edgeTraceJSON = `{"trace":{"resourceSpans":[
 	{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"edge_processing"}}]},"scopeSpans":[{"spans":[
-		{"spanId":"cf1","name":"cloudflare_request"},
+		{"spanId":"cf1","name":"cloudflare_request","attributes":[{"key":"server.address","value":{"stringValue":"grif-test.example"}}]},
 		{"spanId":"cf2","parentSpanId":"cf1","name":"response"}]}]},
 	{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"origin_fetch"}}]},"scopeSpans":[{"spans":[
 		{"spanId":"of1","parentSpanId":"cf1","name":"origin"}]}]},
 	{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"traefik"}}]},"scopeSpans":[{"spans":[
-		{"spanId":"t1","parentSpanId":"of1","name":"router"},
+		{"spanId":"t1","parentSpanId":"of1","name":"router","attributes":[{"key":"server.address","value":{"stringValue":"grif-test.example"}}]},
 		{"spanId":"t1b","parentSpanId":"t1","name":"ReverseProxy"},
 		{"spanId":"t2","parentSpanId":"g2","name":"inner secret"},
 		{"spanId":"t3","name":"unrelated secret"}]}]},
@@ -236,11 +236,14 @@ const edgeTraceJSON = `{"trace":{"resourceSpans":[
 		{"spanId":"o1","parentSpanId":"t2","name":"other secret"}]}]}
 ]}}`
 
+// The hosts grif-test's IngressRoutes serve (Hosts).
+var testHosts = map[string]bool{"grif-test.example": true}
+
 func TestFilterTraceKeepsTheEdgeSpansTheTenantsSitUnder(t *testing.T) {
 	edge := map[string]bool{"edge_processing": true, "origin_fetch": true, "traefik": true}
 	var body map[string]any
 	json.Unmarshal([]byte(edgeTraceJSON), &body)
-	if !FilterTrace(body, "grif-test", Related{Edge: edge}) {
+	if !FilterTrace(body, "grif-test", Related{Edge: edge}, testHosts) {
 		t.Fatal("want kept")
 	}
 	out, _ := json.Marshal(body)
@@ -254,11 +257,11 @@ func TestFilterTraceKeepsTheEdgeSpansTheTenantsSitUnder(t *testing.T) {
 	}
 
 	json.Unmarshal([]byte(edgeTraceJSON), &body)
-	if FilterTrace(body, "grif-prod", Related{Edge: edge}) {
+	if FilterTrace(body, "grif-prod", Related{Edge: edge}, testHosts) {
 		t.Error("a trace with the edge's spans but not the tenant's is refused")
 	}
 	json.Unmarshal([]byte(edgeTraceJSON), &body)
-	FilterTrace(body, "grif-test", Related{})
+	FilterTrace(body, "grif-test", Related{}, testHosts)
 	if out, _ := json.Marshal(body); strings.Contains(string(out), "router") {
 		t.Errorf("without edge services only the tenant's spans: %s", out)
 	}
@@ -282,7 +285,7 @@ func TestFilterTraceKeepsTheDownstreamSpansUnderTheTenants(t *testing.T) {
 	related := Related{Downstream: map[string]bool{"halo-gateway": true}}
 	var body map[string]any
 	json.Unmarshal([]byte(downstreamTraceJSON), &body)
-	if !FilterTrace(body, "grif-test", related) {
+	if !FilterTrace(body, "grif-test", related, testHosts) {
 		t.Fatal("want kept")
 	}
 	out, _ := json.Marshal(body)
@@ -297,12 +300,12 @@ func TestFilterTraceKeepsTheDownstreamSpansUnderTheTenants(t *testing.T) {
 
 	// An edge-only setting keeps no downstream span, and a downstream one no edge span above the tenant's
 	json.Unmarshal([]byte(downstreamTraceJSON), &body)
-	FilterTrace(body, "grif-test", Related{Edge: map[string]bool{"halo-gateway": true}})
+	FilterTrace(body, "grif-test", Related{Edge: map[string]bool{"halo-gateway": true}}, testHosts)
 	if out, _ := json.Marshal(body); strings.Contains(string(out), "GET /stats") {
 		t.Errorf("an edge service's span under the tenant's kept: %s", out)
 	}
 	json.Unmarshal([]byte(edgeTraceJSON), &body)
-	FilterTrace(body, "grif-test", Related{Downstream: map[string]bool{"traefik": true}})
+	FilterTrace(body, "grif-test", Related{Downstream: map[string]bool{"traefik": true}}, testHosts)
 	if out, _ := json.Marshal(body); strings.Contains(string(out), "router") || !strings.Contains(string(out), "inner secret") {
 		t.Errorf("a downstream service kept above the tenant's, or not under it: %s", out)
 	}
@@ -326,14 +329,14 @@ func TestFilterSearchNamesOnlyTheTenantsRootAndCounts(t *testing.T) {
 // grif-prod), grif-prod calling grif-test through Traefik, and grif-test's browser span above Cloudflare's.
 const edgeLeakJSON = `{"trace":{"resourceSpans":[
 	{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"edge_processing"}}]},"scopeSpans":[{"spans":[
-		{"spanId":"cf1","parentSpanId":"b1","name":"shared request secret"},
+		{"spanId":"cf1","parentSpanId":"b1","name":"shared request secret","attributes":[{"key":"server.address","value":{"stringValue":"grif-test.example"}}]},
 		{"spanId":"cf2","parentSpanId":"cf1","name":"shared response secret"}]}]},
 	{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"origin_fetch"}}]},"scopeSpans":[{"spans":[
 		{"spanId":"of1","parentSpanId":"cf1","name":"origin"},
 		{"spanId":"of2","parentSpanId":"cf1","name":"prod origin secret"}]}]},
 	{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"traefik"}}]},"scopeSpans":[{"spans":[
-		{"spanId":"t1","parentSpanId":"of1","name":"router"},
-		{"spanId":"t5","parentSpanId":"of2","name":"prod router secret"},
+		{"spanId":"t1","parentSpanId":"of1","name":"router","attributes":[{"key":"server.address","value":{"stringValue":"grif-test.example"}}]},
+		{"spanId":"t5","parentSpanId":"of2","name":"prod router secret","attributes":[{"key":"server.address","value":{"stringValue":"prod.example"}}]},
 		{"spanId":"t6","parentSpanId":"p2","name":"prod call secret"}]}]},
 	{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"grif-test"}}]},"scopeSpans":[{"spans":[
 		{"spanId":"b1","name":"browser click"},
@@ -348,7 +351,7 @@ func TestFilterTraceKeepsOnlyTheEdgeSpansOfTheTenantsOwnRequests(t *testing.T) {
 	edge := map[string]bool{"edge_processing": true, "origin_fetch": true, "traefik": true}
 	var body map[string]any
 	json.Unmarshal([]byte(edgeLeakJSON), &body)
-	if !FilterTrace(body, "grif-test", Related{Edge: edge}) {
+	if !FilterTrace(body, "grif-test", Related{Edge: edge}, testHosts) {
 		t.Fatal("want kept")
 	}
 	out, _ := json.Marshal(body)
@@ -378,12 +381,12 @@ const duplicateIDJSON = `{"trace":{"resourceSpans":[
 // Traefik call has no callee here.
 const missingCalleeJSON = `{"trace":{"resourceSpans":[
 	{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"edge_processing"}}]},"scopeSpans":[{"spans":[
-		{"spanId":"cf1","name":"shared request secret"}]}]},
+		{"spanId":"cf1","name":"shared request secret","attributes":[{"key":"server.address","value":{"stringValue":"grif-test.example"}}]}]}]},
 	{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"origin_fetch"}}]},"scopeSpans":[{"spans":[
 		{"spanId":"of1","parentSpanId":"cf1","name":"origin"},
 		{"spanId":"of2","parentSpanId":"cf1","name":"other origin secret"}]}]},
 	{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"traefik"}}]},"scopeSpans":[{"spans":[
-		{"spanId":"t1","parentSpanId":"of1","name":"router","kind":"SPAN_KIND_SERVER"},
+		{"spanId":"t1","parentSpanId":"of1","name":"router","kind":"SPAN_KIND_SERVER","attributes":[{"key":"server.address","value":{"stringValue":"grif-test.example"}}]},
 		{"spanId":"t5","parentSpanId":"of2","name":"other router secret","kind":"SPAN_KIND_SERVER"},
 		{"spanId":"t5b","parentSpanId":"t5","name":"other proxy secret","kind":"SPAN_KIND_CLIENT"}]}]},
 	{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"grif-test"}}]},"scopeSpans":[{"spans":[
@@ -393,7 +396,7 @@ const missingCalleeJSON = `{"trace":{"resourceSpans":[
 func TestFilterTraceTreatsACallWhoseCalleeIsMissingAsAnotherApps(t *testing.T) {
 	var body map[string]any
 	json.Unmarshal([]byte(missingCalleeJSON), &body)
-	FilterTrace(body, "grif-test", Related{Edge: map[string]bool{"edge_processing": true, "origin_fetch": true, "traefik": true}})
+	FilterTrace(body, "grif-test", Related{Edge: map[string]bool{"edge_processing": true, "origin_fetch": true, "traefik": true}}, testHosts)
 	out, _ := json.Marshal(body)
 	if strings.Contains(string(out), "secret") {
 		t.Errorf("a span of a request to an app not in the trace left in: %s", out)
@@ -414,7 +417,7 @@ func TestFilterTraceEndsOnACycleOfEdgeSpans(t *testing.T) {
 			{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"grif-test"}}]},"scopeSpans":[{"spans":[
 				{"spanId":"g","parentSpanId":"f","name":"mine"}]}]}]}}`), &body)
 		done := make(chan bool, 1)
-		go func() { done <- FilterTrace(body, "grif-test", Related{Edge: map[string]bool{"traefik": true}}) }()
+		go func() { done <- FilterTrace(body, "grif-test", Related{Edge: map[string]bool{"traefik": true}}, testHosts) }()
 		select {
 		case <-done:
 		case <-time.After(5 * time.Second):
@@ -426,10 +429,137 @@ func TestFilterTraceEndsOnACycleOfEdgeSpans(t *testing.T) {
 	}
 }
 
+// edgeChain: n Traefik spans in a chain above grif-test's g, the top one carrying host.
+func edgeChain(n int, host string) map[string]any {
+	var spans []string
+	for i := 0; i < n; i++ {
+		parent := ""
+		if i+1 < n {
+			parent = fmt.Sprintf(`,"parentSpanId":"e%d"`, i+1)
+		}
+		attrs := ""
+		if i+1 == n && host != "" {
+			attrs = `,"attributes":[{"key":"server.address","value":{"stringValue":"` + host + `"}}]`
+		}
+		spans = append(spans, fmt.Sprintf(`{"spanId":"e%d"%s,"name":"edge %d"%s}`, i, parent, i, attrs))
+	}
+	var body map[string]any
+	json.Unmarshal([]byte(`{"trace":{"resourceSpans":[
+		{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"traefik"}}]},"scopeSpans":[{"spans":[`+strings.Join(spans, ",")+`]}]},
+		{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"grif-test"}}]},"scopeSpans":[{"spans":[
+			{"spanId":"g","parentSpanId":"e0","name":"mine"}]}]}]}}`), &body)
+	return body
+}
+
+func TestFilterTraceShowsAnEdgeChainOnlyWithTheTenantsHost(t *testing.T) {
+	traefik := Related{Edge: map[string]bool{"traefik": true}}
+	shown := func(body map[string]any) bool {
+		out, _ := json.Marshal(body)
+		return strings.Contains(string(out), "edge 0")
+	}
+	cases := []struct {
+		name  string
+		body  map[string]any
+		hosts map[string]bool
+		want  bool
+	}{
+		{"the tenant's host", edgeChain(3, "grif-test.example"), testHosts, true},
+		{"another host", edgeChain(3, "prod.example"), testHosts, false},
+		{"no host at all", edgeChain(3, ""), testHosts, false},
+		{"an address, not a host", edgeChain(3, "10.42.3.22"), map[string]bool{"10.42.3.22": true}, false},
+		{"no hosts known (the lookup failed)", edgeChain(3, "grif-test.example"), nil, false},
+		{"32 spans", edgeChain(32, "grif-test.example"), testHosts, true},
+		{"33 spans", edgeChain(33, "grif-test.example"), testHosts, false},
+	}
+	for _, c := range cases {
+		if FilterTrace(c.body, "grif-test", traefik, c.hosts); shown(c.body) != c.want {
+			t.Errorf("%s: shown %v, want %v", c.name, !c.want, c.want)
+		}
+	}
+}
+
+func TestFilterTraceStopsAChainAtAnotherHost(t *testing.T) {
+	// grif-test's own Traefik router, under the Cloudflare request of another host (another app's request that reached
+	// grif-test): the router is shown, the other host's request not
+	var body map[string]any
+	json.Unmarshal([]byte(`{"trace":{"resourceSpans":[
+		{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"edge_processing"}}]},"scopeSpans":[{"spans":[
+			{"spanId":"cf","name":"other request secret","attributes":[{"key":"server.address","value":{"stringValue":"prod.example"}}]}]}]},
+		{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"traefik"}}]},"scopeSpans":[{"spans":[
+			{"spanId":"t","parentSpanId":"cf","name":"router","attributes":[{"key":"server.address","value":{"stringValue":"grif-test.example"}}]}]}]},
+		{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"grif-test"}}]},"scopeSpans":[{"spans":[
+			{"spanId":"g","parentSpanId":"t","name":"mine"}]}]}]}}`), &body)
+	FilterTrace(body, "grif-test", Related{Edge: map[string]bool{"edge_processing": true, "traefik": true}}, testHosts)
+	out, _ := json.Marshal(body)
+	if strings.Contains(string(out), "secret") || !strings.Contains(string(out), `"router"`) {
+		t.Errorf("got %s", out)
+	}
+}
+
+func TestIngressRouteHosts(t *testing.T) {
+	calls := 0
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if r.Header.Get("Authorization") != "Bearer token" {
+			w.WriteHeader(401)
+			return
+		}
+		switch r.URL.Path {
+		case "/apis/traefik.io/v1alpha1/namespaces/grif-test/ingressroutes":
+			io.WriteString(w, strings.ReplaceAll(`{"items":[{"spec":{"routes":[
+				{"match":"Host(´grif-test.example´)"},
+				{"match":"Host(´grif-test.example´) && PathRegexp(´^/hub/´)"},
+				{"match":"(Host(´a.example´) || Host(´b.example´)) && PathPrefix(´/x´)"}]}}]}`, "´", "`"))
+		default:
+			w.WriteHeader(500)
+		}
+	}))
+	defer api.Close()
+	h := newIngressRouteHosts(api.URL, api.Client(), func() (string, error) { return "token", nil })
+
+	got, err := h.Hosts(context.Background(), "grif-test")
+	if err != nil || len(got) != 3 || !got["grif-test.example"] || !got["a.example"] || !got["b.example"] {
+		t.Errorf("got %v %v", got, err)
+	}
+	h.Hosts(context.Background(), "grif-test")
+	if calls != 1 {
+		t.Errorf("not cached: %d calls", calls)
+	}
+	if got, err := h.Hosts(context.Background(), "grif-prod"); err == nil || got != nil {
+		t.Errorf("API failing: want an error and no hosts, got %v %v", got, err)
+	}
+}
+
+type failingHosts struct{}
+
+func (failingHosts) Hosts(context.Context, string) (map[string]bool, error) { return nil, fmt.Errorf("API down") }
+
+func TestTempoTraceShowsNoEdgeSpansWhenTheHostsCantBeRead(t *testing.T) {
+	u, _ := upstream(t, 200, edgeTraceJSON)
+	h := &Tempo{Gate: gate(u, tenants), Related: Related{Edge: map[string]bool{"edge_processing": true, "origin_fetch": true, "traefik": true}}, Hosts: failingHosts{}}
+	rec := call(h, "GET", "/api/v2/traces/0123abc", "10.0.1.5", nil)
+	if rec.Code != 200 || strings.Contains(rec.Body.String(), "cloudflare_request") || !strings.Contains(rec.Body.String(), "GET x") {
+		t.Errorf("got %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestCheckRelated(t *testing.T) {
+	namespaces := regexp.MustCompile(`^grif-(prod|test)$`)
+	if err := checkRelated(Related{Edge: map[string]bool{"traefik": true}, Downstream: map[string]bool{"halo-gateway": true}}, namespaces); err != nil {
+		t.Errorf("valid: %v", err)
+	}
+	if err := checkRelated(Related{Edge: map[string]bool{"traefik": true}, Downstream: map[string]bool{"traefik": true}}, namespaces); err == nil {
+		t.Error("a service in both lists is accepted")
+	}
+	if err := checkRelated(Related{Edge: map[string]bool{"grif-test": true}}, namespaces); err == nil {
+		t.Error("a tenant as an edge service is accepted")
+	}
+}
+
 func TestFilterTraceFollowsNoSpanIDTwoSpansShare(t *testing.T) {
 	var body map[string]any
 	json.Unmarshal([]byte(duplicateIDJSON), &body)
-	FilterTrace(body, "grif-test", Related{Downstream: map[string]bool{"halo-gateway": true}})
+	FilterTrace(body, "grif-test", Related{Downstream: map[string]bool{"halo-gateway": true}}, testHosts)
 	if out, _ := json.Marshal(body); strings.Contains(string(out), "secret") {
 		t.Errorf("a span under a shared id left in: %s", out)
 	}
