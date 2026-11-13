@@ -159,22 +159,65 @@ func routeHosts(match string) []string {
 }
 
 // ruleClaims is what a rule claims, for which hosts one namespace alone claims: its hosts, or for a rule the gate
-// can't read every quoted string in it (what it might route: claiming more only makes fewer hosts anyone's).
+// can't read every quoted string in it (what it might route: claiming more only makes fewer hosts anyone's), except
+// the arguments of a Host it plainly excludes (excludedHosts).
 func ruleClaims(match string) []string {
 	if hosts, ok := readHosts(match); ok {
 		return hosts
 	}
+	excluded, _ := excludedHosts(match)
 	var claims []string
 	for i := 0; i < len(match); i++ {
 		if c := match[i]; c == '`' || c == '"' {
 			text, end, _ := quoted(match, i)
-			if host := normalHost(text); host != "" {
+			if host := normalHost(text); host != "" && !excluded[i] {
 				claims = append(claims, host)
 			}
 			i = end
 		}
 	}
 	return claims
+}
+
+// excludedHosts finds where the arguments of each plainly excluded Host start (a ! right before Host(, spaces
+// between): a host the rule only excludes is one it never routes. Only when every ! outside quoted text is one of
+// those, and there is no comment: a negated group or a double negation could route what a !Host names. Not ok
+// (nothing excluded) otherwise.
+func excludedHosts(match string) (map[int]bool, bool) {
+	excluded := map[int]bool{}
+	for i := 0; i < len(match); i++ {
+		switch c := match[i]; {
+		case c == '`' || c == '"':
+			_, end, ok := quoted(match, i)
+			if !ok {
+				return nil, false
+			}
+			i = end
+		case strings.HasPrefix(match[i:], "/*") || strings.HasPrefix(match[i:], "//"):
+			return nil, false
+		case c == '!':
+			j := i + 1
+			for j < len(match) && match[j] == ' ' {
+				j++
+			}
+			if !strings.HasPrefix(match[j:], "Host(") {
+				return nil, false
+			}
+			start := j + len("Host(")
+			_, end, ok := quotedArgs(match, start)
+			if !ok {
+				return nil, false
+			}
+			for k := start; k < end; k++ {
+				if c := match[k]; c == '`' || c == '"' {
+					excluded[k] = true
+					_, k, _ = quoted(match, k)
+				}
+			}
+			i = end
+		}
+	}
+	return excluded, true
 }
 
 // readHosts reads a rule's hosts as routeHosts does, and whether the gate could read it.
