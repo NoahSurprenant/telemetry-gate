@@ -63,8 +63,8 @@ func TestIngressRouteHostsCountsAnUnreadableRulesHostsAsClaimed(t *testing.T) {
 func TestIngressRouteHostsLeavesAHostARuleOnlyExcludes(t *testing.T) {
 	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte(`{"items":[
-			{"metadata":{"namespace":"link-preview"},"spec":{"routes":[{"match":"HostRegexp(`^.+\\.example$`) && !Host(`a.example`) && ! Host(`b.example`, \"c.example\") && HeaderRegexp(`User-Agent`, `Discordbot`)"}]}},
-			{"metadata":{"namespace":"grif-test"},"spec":{"routes":[{"match":"Host(`b.example`)"}]}}]}`))
+			{"metadata":{"namespace":"link-preview"},"spec":{"routes":[{"match":"HostRegexp(\u0060^.+\\.example$\u0060) && !Host(\u0060a.example\u0060) && ! Host(\u0060b.example\u0060, \"c.example\") && HeaderRegexp(\u0060User-Agent\u0060, \u0060Discordbot\u0060)"}]}},
+			{"metadata":{"namespace":"grif-test"},"spec":{"routes":[{"match":"Host(\u0060b.example\u0060)"}]}}]}`))
 	}))
 	defer api.Close()
 	h := newIngressRouteHosts(api.URL, api.Client(), func() (string, error) { return "token", nil })
