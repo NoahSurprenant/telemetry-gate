@@ -39,7 +39,8 @@ A tenant's hosts are the `Host(...)` matchers' quoted arguments of the Traefik I
 (read as Traefik reads rules: quoted text with Go escapes; a rule with a `!` or a comment outside quoted text,
 anywhere in it, or unterminated quoted text, gives no hosts, and neither does an argument that is an address or holds
 `:`, `[`, `]`, `@` or an escape. Such a rule still claims every quoted string in it, so a host it might route is no
-one's), read cluster-wide from the Kubernetes
+one's, except a plainly excluded `!Host(...)`'s arguments, which it never routes, when every `!` in it is one of those
+and it has no comment: a catch-all that leaves out another namespace's host doesn't take it), read cluster-wide from the Kubernetes
 API on a context of the gate's own (kept 15s, a failed read 5s from when it ends, one read at a time). A host more
 than one namespace claims is no one's (so a namespace can hide another's edge spans by claiming its host, never show
 its own). An IP address in `server.address` is no host: on a client call (Traefik's proxying) it is ignored, on any
