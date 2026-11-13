@@ -58,7 +58,7 @@ func (t *Tempo) search(w http.ResponseWriter, r *http.Request) {
 	}
 	kept := only(values, "start", "end", "limit", "spss", "minDuration", "maxDuration")
 	kept.Set("q", q)
-	t.filter(w, r, tenant, r.URL.Path, kept, func(body map[string]any) bool { return FilterSearch(body, tenant, t.Related) })
+	t.filter(w, r, tenant, r.URL.Path, kept, func(body map[string]any) bool { return FilterSearch(body, tenant) })
 }
 
 func (t *Tempo) trace(w http.ResponseWriter, r *http.Request) {
@@ -150,10 +150,9 @@ func EnforceTraceQL(query, tenant string) (string, error) {
 }
 
 // FilterSearch keeps what a search may say about other services: a trace's root is named only when it is the
-// tenant's or an edge service's (every trace found has the tenant's spans), and the per-service counts keep the
-// tenant's and the related services'. The matched spans are the tenant's already. False when the answer isn't a
-// search's.
-func FilterSearch(body map[string]any, tenant string, related Related) bool {
+// tenant's, and the per-service counts keep the tenant's (a root or a count of the related services' may be another
+// request's). The matched spans are the tenant's already. False when the answer isn't a search's.
+func FilterSearch(body map[string]any, tenant string) bool {
 	traces, ok := body["traces"].([]any)
 	if !ok {
 		_, has := body["traces"]
@@ -164,13 +163,13 @@ func FilterSearch(body map[string]any, tenant string, related Related) bool {
 		if !ok {
 			continue
 		}
-		if root, _ := trace["rootServiceName"].(string); root != tenant && !related.Edge[root] {
+		if trace["rootServiceName"] != tenant {
 			delete(trace, "rootServiceName")
 			delete(trace, "rootTraceName")
 		}
 		if stats, ok := trace["serviceStats"].(map[string]any); ok {
 			for service := range stats {
-				if service != tenant && !related.Edge[service] && !related.Downstream[service] {
+				if service != tenant {
 					delete(stats, service)
 				}
 			}
@@ -179,74 +178,147 @@ func FilterSearch(body map[string]any, tenant string, related Related) bool {
 	return true
 }
 
-// FilterTrace keeps a trace's resource spans whose service.name is the tenant; of the edge services' spans the ones
-// the tenant's sit under (Cloudflare's request, Traefik's router) and their own edge spans (Cloudflare's firewall and
-// response); and of the downstream services' spans the ones under the tenant's (the Halo gateway's), through
-// downstream spans only. Not an edge span under the tenant's (an ingress the tenant calls through to another app), nor
-// one of another request's. False when the tenant has no spans.
+// FilterTrace keeps a trace's resource spans whose service.name is the tenant, and of the related services' spans
+// only those of the tenant's own requests (false when the tenant has no spans):
+//   - edge: the chain of edge spans a tenant's span sits under, when the chain starts the trace or sits under the
+//     tenant's own span (its browser's), not under another service's (another app calling the tenant through the
+//     ingress); and those spans' edge descendants that lead to no other service (Cloudflare's firewall and response,
+//     not a second origin fetch for another app);
+//   - downstream: the spans under the tenant's, through downstream spans only (the Halo gateway's).
+//
+// A span id two spans share links nothing: the trace's spans come from its services, a tenant's included, so one
+// could reuse another's id to sit under or over its spans.
 func FilterTrace(body map[string]any, tenant string, related Related) bool {
-	edge, downstream := related.Edge, related.Downstream
 	trace, ok := body["trace"].(map[string]any)
 	if !ok {
 		return false
 	}
 	resources, _ := trace["resourceSpans"].([]any)
+	if len(related.Edge) == 0 && len(related.Downstream) == 0 {
+		return keepResources(trace, resources, tenant, Related{}, nil)
+	}
 
-	type ref struct{ parent, service string }
-	spans := map[string]ref{}
-	children := map[string][]string{}
+	g := indexSpans(resources)
+	shown := map[string]bool{}
+
+	// Edge: the chains above the tenant's spans that are the tenant's requests', and their edge descendants
+	var edgeQueue []string
+	for _, id := range g.of(tenant) {
+		if g.shared[id] {
+			continue
+		}
+		var chain []string
+		top := g.spans[id].parent
+		for top != "" && !g.shared[top] && related.Edge[g.service(top)] {
+			chain = append(chain, top)
+			top = g.spans[top].parent
+		}
+		if top != "" && g.known(top) && (g.shared[top] || g.service(top) != tenant) {
+			continue
+		}
+		for _, edgeID := range chain {
+			if !shown[edgeID] {
+				shown[edgeID] = true
+				edgeQueue = append(edgeQueue, edgeID)
+			}
+		}
+	}
+	leadsElsewhere := map[string]bool{}
+	var visiting map[string]bool
+	var elsewhere func(id string) bool
+	elsewhere = func(id string) bool {
+		if v, done := leadsElsewhere[id]; done {
+			return v
+		}
+		if visiting[id] {
+			return true // a cycle: no tree, so nothing to show
+		}
+		visiting[id] = true
+		result := false
+		for _, child := range g.children[id] {
+			switch service := g.service(child); {
+			case g.shared[child]:
+				result = true
+			case service == tenant:
+			case related.Edge[service]:
+				result = result || elsewhere(child)
+			default:
+				result = true
+			}
+		}
+		leadsElsewhere[id] = result
+		return result
+	}
+	visiting = map[string]bool{}
+	g.descend(edgeQueue, shown, func(child string) bool {
+		return related.Edge[g.service(child)] && !elsewhere(child)
+	})
+
+	// Downstream: under the tenant's spans
+	var downQueue []string
+	for _, id := range g.of(tenant) {
+		if !g.shared[id] {
+			downQueue = append(downQueue, id)
+		}
+	}
+	g.descend(downQueue, shown, func(child string) bool { return related.Downstream[g.service(child)] })
+
+	return keepResources(trace, resources, tenant, related, shown)
+}
+
+// spanGraph indexes a trace's spans by id: each one's parent and service, its children, and the ids more than one
+// span has (shared, linked to nothing).
+type spanGraph struct {
+	spans     map[string]spanRef
+	children  map[string][]string
+	shared    map[string]bool
+	byService map[string][]string
+}
+
+type spanRef struct{ parent, service string }
+
+func indexSpans(resources []any) spanGraph {
+	g := spanGraph{spans: map[string]spanRef{}, children: map[string][]string{}, shared: map[string]bool{}, byService: map[string][]string{}}
 	for _, rs := range resources {
 		service := serviceName(rs)
 		for _, span := range spansOf(rs) {
 			id, _ := span["spanId"].(string)
+			if id == "" {
+				continue
+			}
 			parent, _ := span["parentSpanId"].(string)
-			if id != "" {
-				spans[id] = ref{parent, service}
-				children[parent] = append(children[parent], id)
+			if _, seen := g.spans[id]; seen {
+				g.shared[id] = true
 			}
+			g.spans[id] = spanRef{parent, service}
+			g.children[parent] = append(g.children[parent], id)
+			g.byService[service] = append(g.byService[service], id)
 		}
 	}
+	return g
+}
 
-	// The edge spans above the tenant's, then their edge descendants
-	shown := map[string]bool{}
-	var queue []string
-	for _, r := range spans {
-		if r.service != tenant {
-			continue
-		}
-		for id := r.parent; id != "" && !shown[id] && edge[spans[id].service]; id = spans[id].parent {
-			shown[id] = true
-			queue = append(queue, id)
-		}
-	}
+func (g spanGraph) known(id string) bool    { _, ok := g.spans[id]; return ok }
+func (g spanGraph) service(id string) string { return g.spans[id].service }
+func (g spanGraph) of(service string) []string { return g.byService[service] }
+
+// descend marks, breadth first from queue, each child take accepts (not a shared id), and goes on from it.
+func (g spanGraph) descend(queue []string, shown map[string]bool, take func(child string) bool) {
 	for len(queue) > 0 {
 		id := queue[0]
 		queue = queue[1:]
-		for _, child := range children[id] {
-			if !shown[child] && edge[spans[child].service] {
+		for _, child := range g.children[id] {
+			if !shown[child] && !g.shared[child] && take(child) {
 				shown[child] = true
 				queue = append(queue, child)
 			}
 		}
 	}
+}
 
-	// The downstream spans under the tenant's, and theirs
-	for id, r := range spans {
-		if r.service == tenant {
-			queue = append(queue, id)
-		}
-	}
-	for len(queue) > 0 {
-		id := queue[0]
-		queue = queue[1:]
-		for _, child := range children[id] {
-			if !shown[child] && downstream[spans[child].service] {
-				shown[child] = true
-				queue = append(queue, child)
-			}
-		}
-	}
-
+// keepResources keeps the tenant's resource spans whole and, of the related services', the shown spans; false when
+// the tenant has none.
+func keepResources(trace map[string]any, resources []any, tenant string, related Related, shown map[string]bool) bool {
 	var kept []any
 	hasTenant := false
 	for _, rs := range resources {
@@ -254,7 +326,7 @@ func FilterTrace(body map[string]any, tenant string, related Related) bool {
 		case service == tenant:
 			hasTenant = true
 			kept = append(kept, rs)
-		case edge[service] || downstream[service]:
+		case related.Edge[service] || related.Downstream[service]:
 			if keepSpans(rs, func(span map[string]any) bool {
 				id, _ := span["spanId"].(string)
 				return id != "" && shown[id]

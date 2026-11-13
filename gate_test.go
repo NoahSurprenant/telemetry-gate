@@ -172,7 +172,7 @@ func TestFilterSearchHidesOtherServicesRoots(t *testing.T) {
 		{"traceID":"b","rootServiceName":"traefik","rootTraceName":"router secret","serviceStats":{"traefik":{"spanCount":1}}}
 	]}`), &body)
 
-	if !FilterSearch(body, "grif-test", Related{}) {
+	if !FilterSearch(body, "grif-test") {
 		t.Fatal("want kept")
 	}
 	out, _ := json.Marshal(body)
@@ -182,10 +182,10 @@ func TestFilterSearchHidesOtherServicesRoots(t *testing.T) {
 	if !strings.Contains(string(out), `"rootTraceName":"GET x"`) {
 		t.Errorf("the tenant's root removed: %s", out)
 	}
-	if !FilterSearch(map[string]any{}, "grif-test", Related{}) {
+	if !FilterSearch(map[string]any{}, "grif-test") {
 		t.Error("an empty answer is kept")
 	}
-	if FilterSearch(map[string]any{"traces": "nonsense"}, "grif-test", Related{}) {
+	if FilterSearch(map[string]any{"traces": "nonsense"}, "grif-test") {
 		t.Error("a malformed answer is refused")
 	}
 }
@@ -311,7 +311,7 @@ func TestFilterSearchNamesOnlyTheTenantsRootAndCounts(t *testing.T) {
 	var body map[string]any
 	json.Unmarshal([]byte(`{"traces":[{"traceID":"a","rootServiceName":"edge_processing","rootTraceName":"another app's request",
 		"serviceStats":{"grif-test":{"spanCount":1},"edge_processing":{"spanCount":4},"halo-gateway":{"spanCount":2}}}]}`), &body)
-	FilterSearch(body, "grif-test", Related{Edge: map[string]bool{"edge_processing": true}, Downstream: map[string]bool{"halo-gateway": true}})
+	FilterSearch(body, "grif-test")
 	out, _ := json.Marshal(body)
 	if strings.Contains(string(out), "another app's request") || strings.Contains(string(out), "edge_processing") || strings.Contains(string(out), "halo-gateway") {
 		t.Errorf("a root or count that may be another request's left in: %s", out)
