@@ -397,7 +397,7 @@ const clientKind = "SPAN_KIND_CLIENT"
 // address on a client call (Traefik's proxying to a pod, whose callee's own spans say whose it is). An address on
 // any other span is another origin's, named so it matches no tenant's host.
 func hostOf(span map[string]any, kind string) string {
-	if host := normalHost(attribute(span, "server.address")); host != "" {
+	if host := normalHost(spanAttribute(span, "server.address")); host != "" {
 		if net.ParseIP(host) != nil {
 			if kind == clientKind {
 				return ""
@@ -409,8 +409,8 @@ func hostOf(span map[string]any, kind string) string {
 	return ""
 }
 
-// attribute reads a span's string attribute; "" when it has none.
-func attribute(span map[string]any, key string) string {
+// spanAttribute reads a span's string attribute; "" when it has none.
+func spanAttribute(span map[string]any, key string) string {
 	attrs, _ := span["attributes"].([]any)
 	for _, a := range attrs {
 		attr, _ := a.(map[string]any)
@@ -453,7 +453,7 @@ func indexSpans(resources []any, callerAttribute string) spanGraph {
 			}
 			caller := ""
 			if callerAttribute != "" {
-				caller = attribute(span, callerAttribute)
+				caller = spanAttribute(span, callerAttribute)
 			}
 			g.spans[id] = spanRef{parent, service, kind, hostOf(span, kind), caller}
 			g.children[parent] = append(g.children[parent], id)
