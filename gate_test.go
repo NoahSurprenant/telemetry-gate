@@ -549,7 +549,10 @@ func TestIngressRouteHosts(t *testing.T) {
 				{"match":"Host( ´s.example´ )"},
 				{"match":"!Host(´grif.prod´)"},
 				{"match":"Header(\"X-Note\", \"Host(´fake.example´)\")"},
-				{"match":"Host(´shared.example´)"}]}},
+				{"match":"Host(´shared.example´)"},
+				{"match":"! Host(´neg1.example´)"},
+				{"match":"!(Host(´neg2.example´) || Host(´neg3.example´))"},
+				{"match":"Header(\"X-Note\", \"a Host(´nested.example´)\")"}]}},
 			{"metadata":{"namespace":"grif-prod"},"spec":{"routes":[
 				{"match":"Host(´grif.prod´) || Host(´shared.example´)"}]}}]}`, "´", "`"))
 	}))
@@ -582,6 +585,92 @@ func TestIngressRouteHosts(t *testing.T) {
 	broken.Hosts(context.Background(), "grif-test")
 	if calls != before+1 {
 		t.Errorf("a failed read is kept briefly: %d calls", calls-before)
+	}
+}
+
+func TestIngressRouteHostsKeepsAFailedReadFromWhenItEnds(t *testing.T) {
+	failedTTL, failedTTLWas := 50*time.Millisecond, failedTTL
+	defer func() { failedTTL = failedTTLWas }()
+	calls := 0
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		time.Sleep(2 * failedTTL)
+		w.WriteHeader(500)
+	}))
+	defer api.Close()
+	h := newIngressRouteHosts(api.URL, api.Client(), func() (string, error) { return "token", nil })
+	h.Hosts(context.Background(), "grif-test")
+	h.Hosts(context.Background(), "grif-test")
+	if calls != 1 {
+		t.Errorf("a read slower than failedTTL was read again at once: %d calls", calls)
+	}
+}
+
+func TestIngressRouteHostsReadsOnItsOwnContext(t *testing.T) {
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, strings.ReplaceAll(`{"items":[{"metadata":{"namespace":"grif-test"},"spec":{"routes":[{"match":"Host(´grif-test.example´)"}]}}]}`, "´", "`"))
+	}))
+	defer api.Close()
+	h := newIngressRouteHosts(api.URL, api.Client(), func() (string, error) { return "token", nil })
+	gone, cancel := context.WithCancel(context.Background())
+	cancel()
+	// A caller that went away doesn't spoil the read every tenant shares
+	if hosts, err := h.Hosts(gone, "grif-test"); err != nil || !hosts["grif-test.example"] {
+		t.Errorf("got %v %v", hosts, err)
+	}
+}
+
+// A forged wide trace: an edge span with the tenant's host, many of the tenant's spans under it, and a long line of
+// edge spans under it too. Filtering stays quick.
+func TestFilterTraceStaysQuickOnAWideForgedTrace(t *testing.T) {
+	const tenantSpans, line = 20000, 70
+	var edge, mine []string
+	edge = append(edge, `{"spanId":"top","name":"top","attributes":[{"key":"server.address","value":{"stringValue":"grif-test.example"}}]}`)
+	for i := 0; i < tenantSpans; i++ {
+		mine = append(mine, fmt.Sprintf(`{"spanId":"m%d","parentSpanId":"top","name":"mine"}`, i))
+	}
+	for i := 0; i < line; i++ {
+		parent := "top"
+		if i > 0 {
+			parent = fmt.Sprintf("l%d", i-1)
+		}
+		edge = append(edge, fmt.Sprintf(`{"spanId":"l%d","parentSpanId":"%s","name":"line"}`, i, parent))
+	}
+	var body map[string]any
+	json.Unmarshal([]byte(`{"trace":{"resourceSpans":[
+		{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"grif-test"}}]},"scopeSpans":[{"spans":[`+strings.Join(mine, ",")+`]}]},
+		{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"traefik"}}]},"scopeSpans":[{"spans":[`+strings.Join(edge, ",")+`]}]}]}}`), &body)
+	done := make(chan bool, 1)
+	go func() { done <- FilterTrace(body, "grif-test", Related{Edge: map[string]bool{"traefik": true}}, testHosts) }()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("still filtering after 5s")
+	}
+}
+
+// An edge span that is no client call naming an address (not a host) is another origin's, not the tenant's.
+func TestFilterTraceTakesAnAddressOnAnEdgeServerSpanForAnotherOrigin(t *testing.T) {
+	var body map[string]any
+	json.Unmarshal([]byte(`{"trace":{"resourceSpans":[
+		{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"traefik"}}]},"scopeSpans":[{"spans":[
+			{"spanId":"top","name":"router","attributes":[{"key":"server.address","value":{"stringValue":"grif-test.example"}}]},
+			{"spanId":"by-ip","parentSpanId":"top","name":"another origin secret","kind":"SPAN_KIND_SERVER","attributes":[{"key":"server.address","value":{"stringValue":"203.0.113.9"}}]},
+			{"spanId":"proxy","parentSpanId":"top","name":"proxy","kind":"SPAN_KIND_CLIENT","attributes":[{"key":"server.address","value":{"stringValue":"10.42.3.22"}}]}]}]},
+		{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"grif-test"}}]},"scopeSpans":[{"spans":[
+			{"spanId":"g","parentSpanId":"proxy","name":"mine"}]}]}]}}`), &body)
+	FilterTrace(body, "grif-test", Related{Edge: map[string]bool{"traefik": true}}, testHosts)
+	if out, _ := json.Marshal(body); strings.Contains(string(out), "secret") {
+		t.Errorf("got %s", out)
+	}
+}
+
+func TestTempoTraceReadsNoHostsWithoutTheTenantsSpans(t *testing.T) {
+	u, _ := upstream(t, 200, `{"trace":{"resourceSpans":[{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"traefik"}}]},"scopeSpans":[{"spans":[{"spanId":"t","name":"x"}]}]}]}}`)
+	hosts := &countingHosts{}
+	h := &Tempo{Gate: gate(u, tenants), Related: Related{Edge: map[string]bool{"traefik": true}}, Hosts: hosts}
+	if rec := call(h, "GET", "/api/v2/traces/0123abc", "10.0.1.5", nil); rec.Code != 404 || hosts.calls != 0 {
+		t.Errorf("got %d, %d host reads", rec.Code, hosts.calls)
 	}
 }
 
