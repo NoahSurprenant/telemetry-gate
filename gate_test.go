@@ -361,12 +361,13 @@ func TestFilterTraceKeepsOnlyTheEdgeSpansOfTheTenantsOwnRequests(t *testing.T) {
 	}
 }
 
-// grif-test reuses grif-prod's span id p1, under which the Halo gateway serves prod's request.
+// grif-test reuses grif-prod's span id p1, under which the Halo gateway serves prod's request (the tenant's span
+// last, so an index that keeps the last span of an id takes it for the tenant's).
 const duplicateIDJSON = `{"trace":{"resourceSpans":[
-	{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"grif-test"}}]},"scopeSpans":[{"spans":[
-		{"spanId":"p1","name":"forged"}]}]},
 	{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"grif-prod"}}]},"scopeSpans":[{"spans":[
 		{"spanId":"p1","name":"prod request"}]}]},
+	{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"grif-test"}}]},"scopeSpans":[{"spans":[
+		{"spanId":"p1","name":"forged"}]}]},
 	{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"halo-gateway"}}]},"scopeSpans":[{"spans":[
 		{"spanId":"h1","parentSpanId":"p1","name":"prod gateway secret"}]}]}
 ]}}`
