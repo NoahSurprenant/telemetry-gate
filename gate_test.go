@@ -569,9 +569,9 @@ func TestIngressRouteHosts(t *testing.T) {
 			t.Errorf("%s missing from %v", host, got)
 		}
 	}
-	// grif-test's unreadable !Host(grif.prod) still claims it, and grif-test and grif-prod both claim shared.example:
-	// neither is anyone's
-	if prod, _ := h.Hosts(context.Background(), "grif-prod"); len(prod) != 0 {
+	// grif-test's !Host(grif.prod) only excludes it, so grif.prod is grif-prod's; grif-test and grif-prod both claim
+	// shared.example: it is no one's
+	if prod, _ := h.Hosts(context.Background(), "grif-prod"); len(prod) != 1 || !prod["grif.prod"] {
 		t.Errorf("prod: %v", prod)
 	}
 	if calls != 1 {
